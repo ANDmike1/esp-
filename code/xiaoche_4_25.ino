@@ -50,10 +50,20 @@ WebServer server(80);
 unsigned long g_lastLcdUpdateMs = 0;
 const unsigned long LCD_UPDATE_INTERVAL_MS = 300;
 bool g_qmaReady = false;
-float g_prevDistanceCm = 0.0f;
-unsigned long g_prevDistanceMs = 0;
-bool g_hasPrevDistance = false;
 float g_speedCms = 0.0f;
+bool g_mspdOnline = false;
+String g_motorRxLine;
+unsigned long g_lastMspdMs = 0;
+const unsigned long MSPD_TIMEOUT_MS = 1200;
+float g_distanceCm = -1.0f;
+unsigned long g_lastUltraSampleMs = 0;
+unsigned long g_lastImuSampleMs = 0;
+const unsigned long ULTRA_SAMPLE_INTERVAL_MS = 70;
+const unsigned long IMU_SAMPLE_INTERVAL_MS = 20;
+float g_imuPitchDeg = 0.0f;
+float g_imuRollDeg = 0.0f;
+float g_imuAccelAbs = 0.0f;
+bool g_hasImuSample = false;
 
 // ===== QMA6100P (per DNESP32S3 Arduino guide chapter 25) =====
 static const uint8_t IMU_DEV_ADDR = 0x12;  // 7-bit address
@@ -154,16 +164,96 @@ void accGetAngle(float accIn[3], float angle[2]) {
   angle[1] = roll * (180.0f / 3.14159265358979323846f);
 }
 
+bool readImuData(float &pitchDeg, float &rollDeg, float &accelAbs) {
+  if (!g_qmaReady) return false;
+  float acc[3];
+  float angle[2];
+  qma6100pReadAccXyz(acc);
+  accGetAngle(acc, angle);
+
+  float accNorm = sqrtf(acc[0] * acc[0] + acc[1] * acc[1] + acc[2] * acc[2]);
+  pitchDeg = angle[0];
+  rollDeg = angle[1];
+  accelAbs = fabsf(accNorm - M_G);
+  return true;
+}
+
+void processMotorLine(const String &lineIn) {
+  String line = lineIn;
+  line.trim();
+  if (!line.startsWith("$MSPD:")) return;
+
+  int colon = line.indexOf(':');
+  int end = line.lastIndexOf('#');
+  if (colon < 0 || end <= colon) return;
+
+  String payload = line.substring(colon + 1, end);
+  int c1 = payload.indexOf(',');
+  int c2 = payload.indexOf(',', c1 + 1);
+  int c3 = payload.indexOf(',', c2 + 1);
+  if (c1 < 0 || c2 < 0 || c3 < 0) return;
+
+  int m1 = payload.substring(0, c1).toInt();
+  int m2 = payload.substring(c1 + 1, c2).toInt();
+  int m3 = payload.substring(c2 + 1, c3).toInt();
+  int m4 = payload.substring(c3 + 1).toInt();
+
+  // Rear-drive car uses M1 and M3 in this project; board speed unit is mm/s.
+  float rearMmps = ((float)m1 + (float)m3) * 0.5f;
+  g_speedCms = rearMmps / 10.0f;
+  g_mspdOnline = true;
+  g_lastMspdMs = millis();
+}
+
+void pollMotorFeedback() {
+  if (g_mspdOnline && (millis() - g_lastMspdMs > MSPD_TIMEOUT_MS)) {
+    g_mspdOnline = false;
+  }
+
+  while (Serial2.available() > 0) {
+    char ch = (char)Serial2.read();
+    if (ch == '#') {
+      g_motorRxLine += ch;
+      processMotorLine(g_motorRxLine);
+      g_motorRxLine = "";
+      continue;
+    }
+
+    if (ch == '\n' || ch == '\r') {
+      continue;
+    }
+
+    g_motorRxLine += ch;
+    if (g_motorRxLine.length() > 96) {
+      g_motorRxLine = "";
+    }
+  }
+}
+
+void updateFastSensors() {
+  unsigned long nowMs = millis();
+
+  // Ultrasonic uses pulseIn (blocking), so keep interval moderate.
+  if (nowMs - g_lastUltraSampleMs >= ULTRA_SAMPLE_INTERVAL_MS) {
+    g_lastUltraSampleMs = nowMs;
+    g_distanceCm = readDistanceCm();
+  }
+
+  // IMU I2C read can run faster.
+  if (g_qmaReady && (nowMs - g_lastImuSampleMs >= IMU_SAMPLE_INTERVAL_MS)) {
+    g_lastImuSampleMs = nowMs;
+    if (readImuData(g_imuPitchDeg, g_imuRollDeg, g_imuAccelAbs)) {
+      g_hasImuSample = true;
+    }
+  }
+}
+
 void updateLcdDistance() {
   if (millis() - g_lastLcdUpdateMs < LCD_UPDATE_INTERVAL_MS) {
     return;
   }
-  unsigned long nowMs = millis();
-  g_lastLcdUpdateMs = nowMs;
-
-  float cm = readDistanceCm();
-  float imuAccelAbs = 0.0f;
-
+  g_lastLcdUpdateMs = millis();
+  float cm = g_distanceCm;
   // Refresh only data area to reduce flicker.
   lcd.fillRect(10, 90, 220, 120, ST77XX_WHITE);
   lcd.setCursor(10, 95);
@@ -172,41 +262,22 @@ void updateLcdDistance() {
 
   if (cm < 0) {
     lcd.print("len: -- cm");
-    g_hasPrevDistance = false;
-    g_speedCms = 0.0f;
   } else {
     lcd.print("len: ");
     lcd.print((int)(cm + 0.5f));
     lcd.print(" cm");
-
-    if (g_hasPrevDistance && nowMs > g_prevDistanceMs) {
-      float dt = (float)(nowMs - g_prevDistanceMs) / 1000.0f;
-      float instSpeed = (cm - g_prevDistanceCm) / dt;  // cm/s
-      g_speedCms = 0.7f * g_speedCms + 0.3f * instSpeed;
-    }
-    g_prevDistanceCm = cm;
-    g_prevDistanceMs = nowMs;
-    g_hasPrevDistance = true;
   }
 
-  if (g_qmaReady) {
-    float acc[3];
-    float angle[2];
-    qma6100pReadAccXyz(acc);
-    accGetAngle(acc, angle);
-
+  if (g_qmaReady && g_hasImuSample) {
     lcd.setCursor(10, 135);
     lcd.print("Pitch:");
-    lcd.print(angle[0], 1);
+    lcd.print(g_imuPitchDeg, 1);
     lcd.print("   ");
 
     lcd.setCursor(10, 165);
     lcd.print("Roll :");
-    lcd.print(angle[1], 1);
+    lcd.print(g_imuRollDeg, 1);
     lcd.print("   ");
-
-    float accNorm = sqrtf(acc[0] * acc[0] + acc[1] * acc[1] + acc[2] * acc[2]);
-    imuAccelAbs = fabsf(accNorm - M_G);
   } else {
     lcd.setCursor(10, 135);
     lcd.print("QMA6100P init fail");
@@ -221,13 +292,17 @@ void updateLcdDistance() {
     lcd.setTextColor(ST77XX_BLUE);
   }
   lcd.print("V:");
-  lcd.print(g_speedCms, 1);
-  lcd.print("cm/s ");
+  if (g_mspdOnline) {
+    lcd.print(g_speedCms, 1);
+    lcd.print("cm/s ");
+  } else {
+    lcd.print("-- cm/s ");
+  }
 
   lcd.setTextColor(ST77XX_BLUE);
   lcd.print("A:");
   if (g_qmaReady) {
-    lcd.print(imuAccelAbs, 2);
+    lcd.print(g_imuAccelAbs, 2);
   } else {
     lcd.print("--");
   }
@@ -369,6 +444,7 @@ void handleRoot() {
     .hint { font-size: 12px; color: #4b5563; margin-top: 8px; }
     .mode { display: flex; gap: 14px; margin-top: 6px; }
     .status { font-size: 12px; color: #065f46; margin-top: 8px; min-height: 18px; }
+    .telemetry { margin-top: 10px; font-size: 12px; color: #1f2937; line-height: 1.7; }
   </style>
 </head>
 <body>
@@ -391,8 +467,16 @@ void handleRoot() {
       <button class="muted" onclick="presetForward()">全前进</button>
       <button class="muted" onclick="presetBackward()">全后退</button>
       <button class="muted" onclick="getLen()">获取距离</button>
+      <button class="muted" onclick="getImu()">获取IMU</button>
+      <button class="muted" onclick="getVA()">获取速度+加速度</button>
+      <button class="muted" id="toggleAutoBtn" onclick="toggleTelemetry()">自动刷新:开</button>
     </div>
     <div class="status" id="status"></div>
+    <div class="telemetry">
+      <div>超声波: <span id="lenView">--</span></div>
+      <div>IMU: <span id="imuView">--</span></div>
+      <div>速度+加速度: <span id="vaView">--</span></div>
+    </div>
   </div>
 
   <script>
@@ -459,12 +543,73 @@ void handleRoot() {
     async function getLen() {
       const cmdRes = await fetch("/api/cmd?cmd=get_len");
       const txt = await cmdRes.text();
+      document.getElementById("lenView").textContent = txt;
       document.getElementById("status").textContent = "超声波: " + txt;
+    }
+
+    async function getImu() {
+      const cmdRes = await fetch("/api/cmd?cmd=get_imu");
+      const txt = await cmdRes.text();
+      document.getElementById("imuView").textContent = txt;
+      document.getElementById("status").textContent = "IMU: " + txt;
+    }
+
+    async function getVA() {
+      const cmdRes = await fetch("/api/cmd?cmd=get_va");
+      const txt = await cmdRes.text();
+      document.getElementById("vaView").textContent = txt;
+      document.getElementById("status").textContent = "V+A: " + txt;
+    }
+
+    async function refreshTelemetry() {
+      try {
+        const [lenRes, imuRes, vaRes] = await Promise.all([
+          fetch("/api/cmd?cmd=get_len"),
+          fetch("/api/cmd?cmd=get_imu"),
+          fetch("/api/cmd?cmd=get_va")
+        ]);
+        const lenTxt = await lenRes.text();
+        const imuTxt = await imuRes.text();
+        const vaTxt = await vaRes.text();
+        document.getElementById("lenView").textContent = lenTxt;
+        document.getElementById("imuView").textContent = imuTxt;
+        document.getElementById("vaView").textContent = vaTxt;
+      } catch (e) {
+        document.getElementById("status").textContent = "自动刷新失败";
+      }
+    }
+
+    let telemetryTimer = null;
+    let telemetryEnabled = true;
+
+    function startTelemetry() {
+      if (telemetryTimer) return;
+      telemetryTimer = setInterval(refreshTelemetry, 500);
+    }
+
+    function stopTelemetry() {
+      if (!telemetryTimer) return;
+      clearInterval(telemetryTimer);
+      telemetryTimer = null;
+    }
+
+    function toggleTelemetry() {
+      telemetryEnabled = !telemetryEnabled;
+      if (telemetryEnabled) {
+        startTelemetry();
+        document.getElementById("toggleAutoBtn").textContent = "自动刷新:开";
+        refreshTelemetry();
+      } else {
+        stopTelemetry();
+        document.getElementById("toggleAutoBtn").textContent = "自动刷新:关";
+      }
     }
 
     sliders.forEach(id => document.getElementById(id).addEventListener("input", refreshValues));
     document.querySelectorAll("input[name=mode]").forEach(el => el.addEventListener("change", updateRangeForMode));
     updateRangeForMode();
+    refreshTelemetry();
+    startTelemetry();
   </script>
 </body>
 </html>
@@ -518,13 +663,41 @@ void handleCmd() {
   cmd.toLowerCase();
 
   if (cmd == "get_len" || cmd == "len" || cmd == "distance") {
-    float cm = readDistanceCm();
-    if (cm < 0) {
+    float cm = g_distanceCm;
+    if (cm < 0.0f) {
       server.send(200, "text/plain; charset=utf-8", "len:-1cm");
       return;
     }
     int cmInt = (int)(cm + 0.5f);
     server.send(200, "text/plain; charset=utf-8", "len:" + String(cmInt) + "cm");
+    return;
+  }
+
+  if (cmd == "get_spd" || cmd == "spd" || cmd == "speed") {
+    if (!g_mspdOnline) {
+      server.send(200, "text/plain; charset=utf-8", "spd:offline");
+      return;
+    }
+    server.send(200, "text/plain; charset=utf-8", "spd:" + String(g_speedCms, 1) + "cm/s");
+    return;
+  }
+
+  if (cmd == "get_imu" || cmd == "imu") {
+    if (!g_qmaReady || !g_hasImuSample) {
+      server.send(200, "text/plain; charset=utf-8", "imu:offline");
+      return;
+    }
+    String s = "pitch:" + String(g_imuPitchDeg, 1) +
+               ",roll:" + String(g_imuRollDeg, 1) +
+               ",acc:" + String(g_imuAccelAbs, 2) + "m/s2";
+    server.send(200, "text/plain; charset=utf-8", s);
+    return;
+  }
+
+  if (cmd == "get_va" || cmd == "va") {
+    String vPart = g_mspdOnline ? String(g_speedCms, 1) + "cm/s" : "offline";
+    String aPart = (g_qmaReady && g_hasImuSample) ? String(g_imuAccelAbs, 2) + "m/s2" : "offline";
+    server.send(200, "text/plain; charset=utf-8", "v:" + vPart + ",a:" + aPart);
     return;
   }
 
@@ -607,8 +780,15 @@ void setup() {
   Serial.printf("LCD init: %s\n", lcdOk ? "OK" : "FAILED");
   g_qmaReady = qma6100pInit();
   Serial.printf("QMA6100P init: %s\n", g_qmaReady ? "OK" : "FAILED");
+  g_distanceCm = readDistanceCm();
+  if (g_qmaReady) {
+    g_hasImuSample = readImuData(g_imuPitchDeg, g_imuRollDeg, g_imuAccelAbs);
+  }
 
   Serial2.begin(MOTOR_BAUD, SERIAL_8N1, MOTOR_UART_RX, MOTOR_UART_TX);
+  delay(50);
+  sendMotorCommand("$upload:0,0,1#");  // Enable driver speed feedback: $MSPD:M1,M2,M3,M4#
+  Serial.println("Motor upload enabled: speed stream ON");
 
   bool wifiOk = connectWifi();
   if (!wifiOk) {
@@ -633,5 +813,7 @@ void setup() {
 
 void loop() {
   server.handleClient();
+  pollMotorFeedback();
+  updateFastSensors();
   updateLcdDistance();
 }
