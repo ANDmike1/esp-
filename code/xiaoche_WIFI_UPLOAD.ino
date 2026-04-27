@@ -377,6 +377,29 @@ void processMotorLine(const String &lineIn) {
   g_lastMspdMs = millis();
 }
 
+void drawLcdWifiBanner() {
+  lcd.fillRect(8, 50, 226, 22, ST77XX_WHITE);
+  lcd.setTextSize(2);
+  lcd.setCursor(10, 52);
+
+  wifi_mode_t mode = WiFi.getMode();
+  if (mode == WIFI_STA) {
+    if (WiFi.status() == WL_CONNECTED) {
+      lcd.setTextColor(ST77XX_GREEN);
+      lcd.print("网络已连接");
+    } else {
+      lcd.setTextColor(ST77XX_RED);
+      lcd.print("WiFi断开");
+    }
+  } else if (mode == WIFI_AP || mode == WIFI_AP_STA) {
+    lcd.setTextColor(ST77XX_BLUE);
+    lcd.print(WiFi.softAPIP().toString());
+  } else {
+    lcd.setTextColor(ST77XX_RED);
+    lcd.print("WiFi未就绪");
+  }
+}
+
 void pollMotorFeedback() {
   if (g_mspdOnline && (millis() - g_lastMspdMs > MSPD_TIMEOUT_MS)) {
     g_mspdOnline = false;
@@ -426,6 +449,9 @@ void updateLcdDistance() {
   }
   g_lastLcdUpdateMs = millis();
   float cm = g_distanceCm;
+
+  drawLcdWifiBanner();
+
   // Refresh only data area to reduce flicker.
   lcd.fillRect(10, 90, 220, 120, ST77XX_WHITE);
   lcd.setCursor(10, 95);
@@ -559,8 +585,7 @@ bool initLcd() {
   lcd.setTextSize(2);
   lcd.setCursor(10, 20);
   lcd.print("ESP32-S3 CAR");
-  lcd.setCursor(10, 55);
-  lcd.print("Distance + IMU");
+  // WiFi 一行在 updateLcdDistance 里刷新（STA 显示「网络已连接」，热点显示 AP IP）
   return true;
 }
 
