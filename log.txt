@@ -15,3 +15,25 @@
 - 已在根目录 `README.md` 的“维护约定”中加入明确规则，作为后续生成版本时的统一命名标准。
 - 本次未执行移动/删源等高风险文件操作。
 待办：无。
+
+--------------------------------------------------------------------------------
+[2026-04-27] 回合：xiaoche_4_25 测速改为 MTEP
+- `xiaoche_4_25.ino`：关闭 `$MSPD`，启用 `$upload:0,1,0#`，解析 `$MTEP` 用轮径与 `ENCODER_PULSES_PER_WHEEL_REV` 在 ESP32 侧换算 cm/s。
+待办：按实车校准 `SPEED_WHEEL_DIAMETER_CM` 与 `ENCODER_PULSES_PER_WHEEL_REV`。
+
+--------------------------------------------------------------------------------
+[2026-04-27] 回合：拆分 4.25 / 4.27 固件文件
+- 将当时工作区中的 `code/xiaoche_4_25.ino` 完整复制为 `code/xiaoche_4_27.ino`（含 MTEP 测速、轮径 6.8cm 等未提交改动）。
+- `code/xiaoche_4_25.ino` 已用 `git checkout HEAD --` 恢复为仓库最近一次提交版本（`$MSPD` + `$upload:0,0,1#`）。
+待办：日常开发使用 `xiaoche_4_27.ino`；若需与远程 main 对齐 4.25，可再 commit/同步。
+
+--------------------------------------------------------------------------------
+[2026-04-27] 回合：xiaoche_4_27 WiFi 实时调试
+- `xiaoche_4_27.ino`：新增 `/debug` 页面、`/api/live` JSON、TCP 8888 推送 JSON 行流；串口打印调试入口 URL。
+待办：无。
+
+--------------------------------------------------------------------------------
+[2026-04-27] 回合：新建 xiaoche_WIFI_UPLOAD.ino（ArduinoOTA）
+- `code/xiaoche_WIFI_UPLOAD.ino`：基于 `xiaoche_4_27.ino`，增加 ArduinoOTA（`OTA_HOSTNAME`/`OTA_PASSWORD`）；须选用带 OTA 的分区表，首次仍 USB 烧录。
+待办：在 IDE「网络端口」上传验证。
+
