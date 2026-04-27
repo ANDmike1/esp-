@@ -5,12 +5,17 @@
 #include <math.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
+#include <ArduinoOTA.h>
 
 // ===== Wi-Fi config =====
 const char *WIFI_SSID = "520卧龙凤雏";
 const char *WIFI_PASS = "gsuxnfeDf26472";
 const char *AP_SSID = "ESP32S3-MOTOR";
 const char *AP_PASS = "12345678";
+
+// ===== ArduinoOTA（与 IDE 网络上传密码一致）=====
+const char *OTA_HOSTNAME = "xiaoche-ota";
+const char *OTA_PASSWORD = "xiaocheota";
 
 // ===== Motor driver UART =====
 static const int MOTOR_UART_RX = 18;  // ESP32-S3 RX <- Driver TX
@@ -954,6 +959,45 @@ void startAccessPointFallback() {
   Serial.println(WiFi.softAPIP());
 }
 
+void initArduinoOta() {
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
+  if (OTA_PASSWORD != nullptr && strlen(OTA_PASSWORD) > 0) {
+    ArduinoOTA.setPassword(OTA_PASSWORD);
+  }
+
+  ArduinoOTA.onStart([]() {
+    Serial.println("[OTA] start update");
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\n[OTA] finished, rebooting");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    unsigned int pct = total ? (progress * 100 / total) : 0;
+    Serial.printf("[OTA] %u%%\r", pct);
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("[OTA] error=%u ", error);
+    if (error == OTA_AUTH_ERROR) {
+      Serial.println("AUTH");
+    } else if (error == OTA_BEGIN_ERROR) {
+      Serial.println("BEGIN");
+    } else if (error == OTA_CONNECT_ERROR) {
+      Serial.println("CONNECT");
+    } else if (error == OTA_RECEIVE_ERROR) {
+      Serial.println("RECEIVE");
+    } else if (error == OTA_END_ERROR) {
+      Serial.println("END");
+    } else {
+      Serial.println("?");
+    }
+  });
+
+  ArduinoOTA.begin();
+  Serial.printf("[OTA] ArduinoOTA hostname=%s IP=%s password=%s\r\n",
+                OTA_HOSTNAME, wifiStationOrApIp().c_str(),
+                (OTA_PASSWORD && strlen(OTA_PASSWORD)) ? "(set)" : "(none)");
+}
+
 void setup() {
   Serial.begin(115200);
   delay(300);
@@ -1004,9 +1048,12 @@ void setup() {
   }
   Serial.printf("WiFi debug: http://%s/debug   JSON: http://%s/api/live   TCP:%u (JSON lines)\r\n",
                 wifiStationOrApIp().c_str(), wifiStationOrApIp().c_str(), (unsigned)DEBUG_TCP_PORT);
+
+  initArduinoOta();
 }
 
 void loop() {
+  ArduinoOTA.handle();
   server.handleClient();
   pollMotorFeedback();
   pollDebugTcp();

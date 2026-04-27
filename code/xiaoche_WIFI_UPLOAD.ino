@@ -49,8 +49,11 @@ static const uint8_t XL9555_OUTPUT_PORT0_REG = 0x02;
 static const uint8_t XL9555_OUTPUT_PORT1_REG = 0x03;
 static const uint8_t XL9555_CONFIG_PORT0_REG = 0x06;
 static const uint8_t XL9555_CONFIG_PORT1_REG = 0x07;
+static const uint8_t XL9555_INPUT_PORT0_REG = 0x00;
+static const uint8_t XL9555_INPUT_PORT1_REG = 0x01;
 static const uint16_t XL9555_LCD_RST = (1U << 10);  // IO1_2
 static const uint16_t XL9555_LCD_PWR = (1U << 11);  // IO1_3
+static const uint16_t XL9555_KEY0 = (1U << 15);     // IO1_7
 
 SPIClass lcdSpi(HSPI);
 Adafruit_ST7789 lcd = Adafruit_ST7789(&lcdSpi, LCD_CS_PIN, LCD_DC_PIN, -1);
@@ -86,6 +89,16 @@ static const unsigned long DEBUG_TCP_JSON_INTERVAL_MS = 100;
 WiFiServer g_debugTcp(DEBUG_TCP_PORT);
 WiFiClient g_debugTcpClient;
 unsigned long g_lastDebugTcpPushMs = 0;
+
+enum LcdPageMode {
+  LCD_PAGE_SPEED = 0,
+  LCD_PAGE_CONN = 1
+};
+LcdPageMode g_lcdPageMode = LCD_PAGE_SPEED;
+bool g_key0RawPressed = false;
+bool g_key0StablePressed = false;
+unsigned long g_key0DebounceMs = 0;
+const unsigned long KEY_DEBOUNCE_MS = 30;
 
 // ===== QMA6100P (per DNESP32S3 Arduino guide chapter 25) =====
 static const uint8_t IMU_DEV_ADDR = 0x12;  // 7-bit address
@@ -400,58 +413,7 @@ void drawLcdWifiBanner() {
   }
 }
 
-void pollMotorFeedback() {
-  if (g_mspdOnline && (millis() - g_lastMspdMs > MSPD_TIMEOUT_MS)) {
-    g_mspdOnline = false;
-  }
-
-  while (Serial2.available() > 0) {
-    char ch = (char)Serial2.read();
-    if (ch == '#') {
-      g_motorRxLine += ch;
-      processMotorLine(g_motorRxLine);
-      g_motorRxLine = "";
-      continue;
-    }
-
-    if (ch == '\n' || ch == '\r') {
-      continue;
-    }
-
-    g_motorRxLine += ch;
-    if (g_motorRxLine.length() > 96) {
-      g_motorRxLine = "";
-    }
-  }
-}
-
-void updateFastSensors() {
-  unsigned long nowMs = millis();
-
-  // Ultrasonic uses pulseIn (blocking), so keep interval moderate.
-  if (nowMs - g_lastUltraSampleMs >= ULTRA_SAMPLE_INTERVAL_MS) {
-    g_lastUltraSampleMs = nowMs;
-    g_distanceCm = readDistanceCm();
-  }
-
-  // IMU I2C read can run faster.
-  if (g_qmaReady && (nowMs - g_lastImuSampleMs >= IMU_SAMPLE_INTERVAL_MS)) {
-    g_lastImuSampleMs = nowMs;
-    if (readImuData(g_imuPitchDeg, g_imuRollDeg, g_imuAccelAbs)) {
-      g_hasImuSample = true;
-    }
-  }
-}
-
-void updateLcdDistance() {
-  if (millis() - g_lastLcdUpdateMs < LCD_UPDATE_INTERVAL_MS) {
-    return;
-  }
-  g_lastLcdUpdateMs = millis();
-  float cm = g_distanceCm;
-
-  drawLcdWifiBanner();
-
+void drawLcdSpeedPage(float cm) {
   // Refresh only data area to reduce flicker.
   lcd.fillRect(10, 90, 220, 120, ST77XX_WHITE);
   lcd.setCursor(10, 95);
@@ -507,6 +469,121 @@ void updateLcdDistance() {
   lcd.print("m/s2");
 }
 
+void drawLcdConnPage() {
+  lcd.fillRect(10, 90, 220, 120, ST77XX_WHITE);
+  lcd.setTextSize(2);
+  lcd.setTextColor(ST77XX_BLUE);
+
+  lcd.setCursor(10, 95);
+  lcd.print("Conn Check");
+  lcd.setCursor(10, 125);
+  lcd.print("IP:");
+  lcd.print(wifiStationOrApIp());
+
+  lcd.setCursor(10, 155);
+  if (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) {
+    lcd.print("AP:");
+    lcd.print(AP_SSID);
+  } else if (WiFi.status() == WL_CONNECTED) {
+    lcd.print("STA:OK");
+  } else {
+    lcd.print("STA:OFFLINE");
+  }
+
+  lcd.setCursor(10, 185);
+  lcd.print("KEY0:Switch");
+}
+
+bool xl9555PinRead(uint16_t pinMask) {
+  const bool isPort1 = pinMask > 0xFF;
+  const uint8_t bitMask = (uint8_t)(pinMask >> (isPort1 ? 8 : 0));
+  const uint8_t reg = isPort1 ? XL9555_INPUT_PORT1_REG : XL9555_INPUT_PORT0_REG;
+  uint8_t inVal = xl9555ReadReg(reg);
+  return (inVal & bitMask) != 0;
+}
+
+void pollKey0SwitchPage() {
+  // KEY circuit is active-low (pressed -> GND).
+  bool rawPressed = !xl9555PinRead(XL9555_KEY0);
+  unsigned long now = millis();
+
+  if (rawPressed != g_key0RawPressed) {
+    g_key0RawPressed = rawPressed;
+    g_key0DebounceMs = now;
+  }
+
+  if (now - g_key0DebounceMs < KEY_DEBOUNCE_MS) {
+    return;
+  }
+
+  if (g_key0StablePressed == g_key0RawPressed) {
+    return;
+  }
+
+  g_key0StablePressed = g_key0RawPressed;
+  if (g_key0StablePressed) {
+    g_lcdPageMode = (g_lcdPageMode == LCD_PAGE_SPEED) ? LCD_PAGE_CONN : LCD_PAGE_SPEED;
+  }
+}
+
+void pollMotorFeedback() {
+  if (g_mspdOnline && (millis() - g_lastMspdMs > MSPD_TIMEOUT_MS)) {
+    g_mspdOnline = false;
+  }
+
+  while (Serial2.available() > 0) {
+    char ch = (char)Serial2.read();
+    if (ch == '#') {
+      g_motorRxLine += ch;
+      processMotorLine(g_motorRxLine);
+      g_motorRxLine = "";
+      continue;
+    }
+
+    if (ch == '\n' || ch == '\r') {
+      continue;
+    }
+
+    g_motorRxLine += ch;
+    if (g_motorRxLine.length() > 96) {
+      g_motorRxLine = "";
+    }
+  }
+}
+
+void updateFastSensors() {
+  unsigned long nowMs = millis();
+
+  // Ultrasonic uses pulseIn (blocking), so keep interval moderate.
+  if (nowMs - g_lastUltraSampleMs >= ULTRA_SAMPLE_INTERVAL_MS) {
+    g_lastUltraSampleMs = nowMs;
+    g_distanceCm = readDistanceCm();
+  }
+
+  // IMU I2C read can run faster.
+  if (g_qmaReady && (nowMs - g_lastImuSampleMs >= IMU_SAMPLE_INTERVAL_MS)) {
+    g_lastImuSampleMs = nowMs;
+    if (readImuData(g_imuPitchDeg, g_imuRollDeg, g_imuAccelAbs)) {
+      g_hasImuSample = true;
+    }
+  }
+}
+
+void updateLcdDistance() {
+  if (millis() - g_lastLcdUpdateMs < LCD_UPDATE_INTERVAL_MS) {
+    return;
+  }
+  g_lastLcdUpdateMs = millis();
+  float cm = g_distanceCm;
+
+  drawLcdWifiBanner();
+  if (g_lcdPageMode == LCD_PAGE_SPEED) {
+    drawLcdSpeedPage(cm);
+  } else {
+    drawLcdConnPage();
+  }
+}
+
 void xl9555WriteReg(uint8_t reg, uint8_t data) {
   Wire.beginTransmission(EXIO_ADDR);
   Wire.write(reg);
@@ -558,6 +635,7 @@ bool initLcd() {
   Wire.begin(EXIO_SDA_PIN, EXIO_SCL_PIN, 400000);
   xl9555IoConfig(XL9555_LCD_RST, true);
   xl9555IoConfig(XL9555_LCD_PWR, true);
+  xl9555IoConfig(XL9555_KEY0, false);
   xl9555PinSet(XL9555_LCD_PWR, true);
   xl9555PinSet(XL9555_LCD_RST, true);
 
@@ -1059,6 +1137,7 @@ void setup() {
 void loop() {
   ArduinoOTA.handle();
   server.handleClient();
+  pollKey0SwitchPage();
   pollMotorFeedback();
   pollDebugTcp();
   updateFastSensors();

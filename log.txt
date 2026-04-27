@@ -37,3 +37,13 @@
 - `code/xiaoche_WIFI_UPLOAD.ino`：基于 `xiaoche_4_27.ino`，增加 ArduinoOTA（`OTA_HOSTNAME`/`OTA_PASSWORD`）；须选用带 OTA 的分区表，首次仍 USB 烧录。
 待办：在 IDE「网络端口」上传验证。
 
+--------------------------------------------------------------------------------
+[2026-04-27] 回合：4.27 同步 OTA
+- `code/xiaoche_4_27.ino`：已加入 ArduinoOTA（头文件、`OTA_HOSTNAME`/`OTA_PASSWORD`、`initArduinoOta()`、`loop()` 中 `ArduinoOTA.handle()`），与 `xiaoche_WIFI_UPLOAD.ino` 保持同类 OTA 能力。
+待办：无。
+
+--------------------------------------------------------------------------------
+[2026-04-27] 回合：KEY0 切换 LCD 双界面
+- `code/xiaoche_WIFI_UPLOAD.ino`：新增 KEY0（XL9555 IO1_7）防抖读取与页面切换，速度页与连接确认页分离显示。
+待办：若按键电平与板卡实际相反，可将 `rawPressed = !xl9555PinRead(...)` 改为不取反。
+
