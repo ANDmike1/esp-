@@ -399,17 +399,17 @@ void drawLcdWifiBanner() {
   if (mode == WIFI_STA) {
     if (WiFi.status() == WL_CONNECTED) {
       lcd.setTextColor(ST77XX_GREEN);
-      lcd.print("网络已连接");
+      lcd.print("WiFi: CONNECTED");
     } else {
       lcd.setTextColor(ST77XX_RED);
-      lcd.print("WiFi断开");
+      lcd.print("WiFi: DISCONNECT");
     }
   } else if (mode == WIFI_AP || mode == WIFI_AP_STA) {
     lcd.setTextColor(ST77XX_BLUE);
     lcd.print(WiFi.softAPIP().toString());
   } else {
     lcd.setTextColor(ST77XX_RED);
-    lcd.print("WiFi未就绪");
+    lcd.print("WiFi: NOT READY");
   }
 }
 
@@ -663,7 +663,7 @@ bool initLcd() {
   lcd.setTextSize(2);
   lcd.setCursor(10, 20);
   lcd.print("ESP32-S3 CAR");
-  // WiFi 一行在 updateLcdDistance 里刷新（STA 显示「网络已连接」，热点显示 AP IP）
+  // WiFi status row is refreshed in updateLcdDistance.
   return true;
 }
 
