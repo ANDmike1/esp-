@@ -22,6 +22,17 @@ static const int MOTOR_UART_RX = 18;  // ESP32-S3 RX <- Driver TX
 static const int MOTOR_UART_TX = 17;  // ESP32-S3 TX -> Driver RX
 static const uint32_t MOTOR_BAUD = 115200;
 
+// 5.2.1 软件层：限频 / 反向经零 / 分步 slew，减轻 H 桥(AT8236)应力；硬件死区仍须在驱动板保证。
+static const unsigned long MOTOR_CMD_MIN_GAP_MS = 45;
+static const unsigned long MOTOR_REVERSAL_ZERO_DWELL_MS = 45;
+static const int MOTOR_SLEW_MAX_DELTA_PWM = 450;
+static const int MOTOR_SLEW_MAX_DELTA_SPD = 150;
+static const int MOTOR_SLEW_MAX_STEPS = 40;
+
+static unsigned long g_lastMotorCmdMs = 0;
+static int g_lastMotorM1Sent = 0;
+static int g_lastMotorM3Sent = 0;
+
 // ===== HY-SRF05 ultrasonic =====
 // 正点原子成品板上通常可直接接排针 GPIO4/GPIO5（避免使用不可用管脚）
 // 如果你的板子丝印不同，只改下面这两行即可。
@@ -670,6 +681,76 @@ String buildCommand(const String &type, int m1, int m2, int m3, int m4) {
   return "$" + type + ":" + String(m1) + "," + String(m2) + "," + String(m3) + "," + String(m4) + "#";
 }
 
+static void motorCommandWaitGap() {
+  if (g_lastMotorCmdMs == 0) {
+    return;
+  }
+  const unsigned long now = millis();
+  if (now - g_lastMotorCmdMs < MOTOR_CMD_MIN_GAP_MS) {
+    delay(MOTOR_CMD_MIN_GAP_MS - (now - g_lastMotorCmdMs));
+  }
+}
+
+static bool motorOppositeSignNonZero(int from, int to) {
+  if (from == 0 || to == 0) {
+    return false;
+  }
+  return (from > 0) != (to > 0);
+}
+
+static int motorStepToward(int from, int to, int maxDelta) {
+  const int d = to - from;
+  if (d > maxDelta) {
+    return from + maxDelta;
+  }
+  if (d < -maxDelta) {
+    return from - maxDelta;
+  }
+  return to;
+}
+
+static void motorSendDriveFrame(const char *typeStr, int m1, int m3) {
+  motorCommandWaitGap();
+  sendMotorCommand(buildCommand(String(typeStr), m1, 0, m3, 0));
+  g_lastMotorCmdMs = millis();
+  g_lastMotorM1Sent = m1;
+  g_lastMotorM3Sent = m3;
+}
+
+static void applyMotorDriveWithGuards(bool isSpd, int m1_tgt, int m3_tgt) {
+  const char *typeStr = isSpd ? "spd" : "pwm";
+  const int slew = isSpd ? MOTOR_SLEW_MAX_DELTA_SPD : MOTOR_SLEW_MAX_DELTA_PWM;
+
+  const bool rev = motorOppositeSignNonZero(g_lastMotorM1Sent, m1_tgt) ||
+                   motorOppositeSignNonZero(g_lastMotorM3Sent, m3_tgt);
+  if (rev) {
+    motorSendDriveFrame(typeStr, 0, 0);
+    delay(MOTOR_REVERSAL_ZERO_DWELL_MS);
+  }
+
+  for (int step = 0; step < MOTOR_SLEW_MAX_STEPS; ++step) {
+    if (g_lastMotorM1Sent == m1_tgt && g_lastMotorM3Sent == m3_tgt) {
+      return;
+    }
+    const int n1 = motorStepToward(g_lastMotorM1Sent, m1_tgt, slew);
+    const int n3 = motorStepToward(g_lastMotorM3Sent, m3_tgt, slew);
+    if (n1 == g_lastMotorM1Sent && n3 == g_lastMotorM3Sent) {
+      motorSendDriveFrame(typeStr, m1_tgt, m3_tgt);
+      return;
+    }
+    motorSendDriveFrame(typeStr, n1, n3);
+    if (n1 == m1_tgt && n3 == m3_tgt) {
+      return;
+    }
+    delay(MOTOR_CMD_MIN_GAP_MS);
+  }
+
+  if (g_lastMotorM1Sent != m1_tgt || g_lastMotorM3Sent != m3_tgt) {
+    motorSendDriveFrame(typeStr, m1_tgt, m3_tgt);
+    Serial.println("[motor] guard: slew step cap, forced final frame");
+  }
+}
+
 float readDistanceCm() {
   digitalWrite(ULTRA_TRIG_PIN, LOW);
   delayMicroseconds(2);
@@ -719,7 +800,7 @@ void handleRoot() {
       <label><input type="radio" name="mode" value="pwm" checked /> PWM模式</label>
       <label><input type="radio" name="mode" value="spd" /> 速度模式(编码器)</label>
     </div>
-    <div class="hint">PWM范围: -3600~3600，速度范围: -1000~1000。可在数字框直接输入 M1/M3，改完点「发送」或框内回车下发。</div>
+    <div class="hint">PWM范围: -3600~3600，速度范围: -1000~1000。可在数字框直接输入 M1/M3，改完点「发送」或框内回车下发。5.2.1：下发时自动限频、反向先经零、分步变速（减轻 H 桥应力）。</div>
   </div>
 
   <div class="card">
@@ -946,8 +1027,8 @@ void handleDrive() {
   int m2 = 0;
   int m4 = 0;
 
-  String command = buildCommand(isSpd ? "spd" : "pwm", m1, m2, m3, m4);
-  sendMotorCommand(command);
+  applyMotorDriveWithGuards(isSpd, m1, m3);
+  const String command = buildCommand(isSpd ? "spd" : "pwm", g_lastMotorM1Sent, m2, g_lastMotorM3Sent, m4);
 
   String resp = "{\"ok\":true,\"command\":\"" + command + "\"}";
   server.send(200, "application/json", resp);
@@ -1123,6 +1204,9 @@ void setup() {
   delay(50);
   // Second flag: $MTEP:M1,M2,M3,M4# (pulse delta per 10 ms). Third flag is $MSPD (needs $wdiameter on board).
   sendMotorCommand("$upload:0,1,0#");
+  g_lastMotorCmdMs = millis();
+  g_lastMotorM1Sent = 0;
+  g_lastMotorM3Sent = 0;
   Serial.println("Motor upload: MTEP ON (10ms pulses), MSPD OFF");
 
   bool wifiOk = connectWifi();
