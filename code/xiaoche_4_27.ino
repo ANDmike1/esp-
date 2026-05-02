@@ -697,6 +697,7 @@ void handleRoot() {
     h2 { font-size: 16px; margin: 0 0 10px; }
     .row { display: flex; gap: 10px; align-items: center; margin: 8px 0; }
     .row label { width: 40px; font-weight: bold; }
+    .row input[type=number].numin { width: 4.75rem; padding: 6px 8px; font-size: 14px; border-radius: 6px; border: 1px solid #cbd5e1; flex-shrink: 0; }
     .row input[type=range] { flex: 1; }
     .value { width: 56px; text-align: right; font-family: monospace; }
     .btns { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
@@ -718,13 +719,13 @@ void handleRoot() {
       <label><input type="radio" name="mode" value="pwm" checked /> PWM模式</label>
       <label><input type="radio" name="mode" value="spd" /> 速度模式(编码器)</label>
     </div>
-    <div class="hint">PWM范围: -3600~3600，速度范围: -1000~1000</div>
+    <div class="hint">PWM范围: -3600~3600，速度范围: -1000~1000。可在数字框直接输入 M1/M3，改完点「发送」或框内回车下发。</div>
   </div>
 
   <div class="card">
     <h2>后驱电机 (M1 / M3)</h2>
-    <div class="row"><label>M1</label><input id="m1" type="range" min="-3600" max="3600" value="0"><span class="value" id="v1">0</span></div>
-    <div class="row"><label>M3</label><input id="m3" type="range" min="-3600" max="3600" value="0"><span class="value" id="v3">0</span></div>
+    <div class="row"><label>M1</label><input type="number" id="n1" class="numin" value="0" step="1" inputmode="numeric"><input id="m1" type="range" min="-3600" max="3600" value="0"><span class="value" id="v1">0</span></div>
+    <div class="row"><label>M3</label><input type="number" id="n3" class="numin" value="0" step="1" inputmode="numeric"><input id="m3" type="range" min="-3600" max="3600" value="0"><span class="value" id="v3">0</span></div>
     <div class="btns">
       <button class="primary" onclick="sendNow()">发送</button>
       <button class="warn" onclick="stopAll()">急停</button>
@@ -745,6 +746,7 @@ void handleRoot() {
 
   <script>
     const sliders = ["m1","m3"];
+    const nums = ["n1","n3"];
     const valueViews = ["v1","v3"];
 
     function modeValue() {
@@ -757,24 +759,43 @@ void handleRoot() {
 
     function updateRangeForMode() {
       const max = currentMax();
-      sliders.forEach(id => {
+      sliders.forEach((id, i) => {
         const el = document.getElementById(id);
         el.min = -max;
         el.max = max;
         el.value = Math.max(-max, Math.min(max, parseInt(el.value, 10) || 0));
+        const numEl = document.getElementById(nums[i]);
+        numEl.min = -max;
+        numEl.max = max;
+        numEl.value = el.value;
       });
       refreshValues();
     }
 
+    function syncFromNum(numId) {
+      const i = nums.indexOf(numId);
+      if (i < 0) return;
+      const max = currentMax();
+      let v = parseInt(document.getElementById(numId).value, 10);
+      if (isNaN(v)) v = 0;
+      v = Math.max(-max, Math.min(max, v));
+      document.getElementById(sliders[i]).value = v;
+      document.getElementById(numId).value = v;
+      document.getElementById(valueViews[i]).textContent = String(v);
+    }
+
     function refreshValues() {
       sliders.forEach((id, i) => {
-        valueViews[i] && (document.getElementById(valueViews[i]).textContent = document.getElementById(id).value);
+        document.getElementById(nums[i]).value = document.getElementById(id).value;
+        document.getElementById(valueViews[i]).textContent = document.getElementById(id).value;
       });
     }
 
     function setAll(v1, v3) {
       document.getElementById("m1").value = v1;
       document.getElementById("m3").value = v3;
+      document.getElementById("n1").value = v1;
+      document.getElementById("n3").value = v3;
       refreshValues();
     }
 
@@ -787,6 +808,8 @@ void handleRoot() {
     }
 
     async function sendNow() {
+      syncFromNum("n1");
+      syncFromNum("n3");
       const payload = {
         mode: modeValue(),
         m1: parseInt(document.getElementById("m1").value, 10),
@@ -870,6 +893,14 @@ void handleRoot() {
     }
 
     sliders.forEach(id => document.getElementById(id).addEventListener("input", refreshValues));
+    nums.forEach(nid => {
+      const el = document.getElementById(nid);
+      el.addEventListener("change", () => syncFromNum(nid));
+      el.addEventListener("blur", () => syncFromNum(nid));
+      el.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") { e.preventDefault(); syncFromNum(nid); sendNow(); }
+      });
+    });
     document.querySelectorAll("input[name=mode]").forEach(el => el.addEventListener("change", updateRangeForMode));
     updateRangeForMode();
     refreshTelemetry();
