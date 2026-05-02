@@ -57,3 +57,9 @@
 - `xiaoche_4_27.ino` 与 `xiaoche_WIFI_UPLOAD.ino`：将 LCD 上的中文 WiFi 状态字样改为 ASCII 英文，避免 Adafruit_GFX 默认字库导致乱码。
 待办：无。
 
+--------------------------------------------------------------------------------
+[2026-05-02] 回合：README 补充 USB 串口 XCDBG1/0
+- 确认 `code/xiaoche_5_2.ino` 上电默认 `g_serialVerbose=false`（静默）；注释标明默认静默并指向 README。
+- 根目录 `README.md` 新增「小车固件 USB 串口」小节，说明 `XCDBG1` / `XCDBG0` 与默认行为。
+待办：无。
+
