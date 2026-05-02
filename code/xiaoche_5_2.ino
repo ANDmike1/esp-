@@ -8,8 +8,8 @@
 #include <Adafruit_ST7789.h>
 #include <ArduinoOTA.h>
 
-// ===== 固件 5.2：Web 页 static PROGMEM + live JSON snprintf，修复 loopTask 栈溢出 =====
-static const char FIRMWARE_VERSION[] = "5.2";
+// ===== 固件 5.2.1：电机 UART 保护 + USB 串口常态静默（XCDBG1/0 切换详细日志）=====
+static const char FIRMWARE_VERSION[] = "5.2.1";
 
 // ===== Wi-Fi config =====
 const char *WIFI_SSID = "520卧龙凤雏";
@@ -25,6 +25,17 @@ const char *OTA_PASSWORD = "xiaocheota";
 static const int MOTOR_UART_RX = 18;  // ESP32-S3 RX <- Driver TX
 static const int MOTOR_UART_TX = 17;  // ESP32-S3 TX -> Driver RX
 static const uint32_t MOTOR_BAUD = 115200;
+
+// 软件层缓解：拉条/连点导致指令过密或正负快速翻转，加重 H 桥(AT8236)应力；硬件死区仍须在驱动板保证。
+static const unsigned long MOTOR_CMD_MIN_GAP_MS = 45;           // 相邻电机帧最小间隔
+static const unsigned long MOTOR_REVERSAL_ZERO_DWELL_MS = 45;  // 反向前先全零，关断后等待时间
+static const int MOTOR_SLEW_MAX_DELTA_PWM = 450;               // PWM 模式单帧 M1/M3 最大变化量
+static const int MOTOR_SLEW_MAX_DELTA_SPD = 150;               // 速度模式单帧最大变化量
+static const int MOTOR_SLEW_MAX_STEPS = 40;                  // 单次 HTTP 请求内最多分步次数
+
+static unsigned long g_lastMotorCmdMs = 0;
+static int g_lastMotorM1Sent = 0;
+static int g_lastMotorM3Sent = 0;
 
 // ===== HY-SRF05 ultrasonic =====
 // 正点原子成品板上通常可直接接排针 GPIO4/GPIO5（避免使用不可用管脚）
@@ -98,6 +109,14 @@ bool g_key0RawPressed = false;
 bool g_key0StablePressed = false;
 unsigned long g_key0DebounceMs = 0;
 const unsigned long KEY_DEBOUNCE_MS = 30;
+
+// ===== USB 串口：默认静默（g_serialVerbose=false）；发 XCDBG1 打开全部调试，XCDBG0 恢复静默 =====
+static bool g_serialVerbose = false;  // 上电默认静默，见 README.md
+static unsigned long g_lastQuietRunLogMs = 0;
+static const unsigned long QUIET_RUN_LOG_INTERVAL_MS = 2000;
+static String s_usbDbgLineBuf;
+
+#define SERIAL_VF(...) do { if (g_serialVerbose) Serial.printf(__VA_ARGS__); } while (0)
 
 // ===== QMA6100P (per DNESP32S3 Arduino guide chapter 25) =====
 static const uint8_t IMU_DEV_ADDR = 0x12;  // 7-bit address
@@ -684,11 +703,84 @@ int clampValue(int value, int minV, int maxV) {
 
 void sendMotorCommand(const String &cmd) {
   Serial2.print(cmd);
-  Serial.println("[TX] " + cmd);
+  if (g_serialVerbose) {
+    Serial.print("[TX] ");
+    Serial.println(cmd);
+  }
 }
 
 String buildCommand(const String &type, int m1, int m2, int m3, int m4) {
   return "$" + type + ":" + String(m1) + "," + String(m2) + "," + String(m3) + "," + String(m4) + "#";
+}
+
+static void motorCommandWaitGap() {
+  if (g_lastMotorCmdMs == 0) {
+    return;
+  }
+  const unsigned long now = millis();
+  if (now - g_lastMotorCmdMs < MOTOR_CMD_MIN_GAP_MS) {
+    delay(MOTOR_CMD_MIN_GAP_MS - (now - g_lastMotorCmdMs));
+  }
+}
+
+static bool motorOppositeSignNonZero(int from, int to) {
+  if (from == 0 || to == 0) {
+    return false;
+  }
+  return (from > 0) != (to > 0);
+}
+
+static int motorStepToward(int from, int to, int maxDelta) {
+  const int d = to - from;
+  if (d > maxDelta) {
+    return from + maxDelta;
+  }
+  if (d < -maxDelta) {
+    return from - maxDelta;
+  }
+  return to;
+}
+
+static void motorSendDriveFrame(const char *typeStr, int m1, int m3) {
+  motorCommandWaitGap();
+  sendMotorCommand(buildCommand(String(typeStr), m1, 0, m3, 0));
+  g_lastMotorCmdMs = millis();
+  g_lastMotorM1Sent = m1;
+  g_lastMotorM3Sent = m3;
+}
+
+static void applyMotorDriveWithGuards(bool isSpd, int m1_tgt, int m3_tgt) {
+  const char *typeStr = isSpd ? "spd" : "pwm";
+  const int slew = isSpd ? MOTOR_SLEW_MAX_DELTA_SPD : MOTOR_SLEW_MAX_DELTA_PWM;
+
+  const bool rev = motorOppositeSignNonZero(g_lastMotorM1Sent, m1_tgt) ||
+                   motorOppositeSignNonZero(g_lastMotorM3Sent, m3_tgt);
+  if (rev) {
+    motorSendDriveFrame(typeStr, 0, 0);
+    delay(MOTOR_REVERSAL_ZERO_DWELL_MS);
+  }
+
+  for (int step = 0; step < MOTOR_SLEW_MAX_STEPS; ++step) {
+    if (g_lastMotorM1Sent == m1_tgt && g_lastMotorM3Sent == m3_tgt) {
+      return;
+    }
+    const int n1 = motorStepToward(g_lastMotorM1Sent, m1_tgt, slew);
+    const int n3 = motorStepToward(g_lastMotorM3Sent, m3_tgt, slew);
+    if (n1 == g_lastMotorM1Sent && n3 == g_lastMotorM3Sent) {
+      motorSendDriveFrame(typeStr, m1_tgt, m3_tgt);
+      return;
+    }
+    motorSendDriveFrame(typeStr, n1, n3);
+    if (n1 == m1_tgt && n3 == m3_tgt) {
+      return;
+    }
+    delay(MOTOR_CMD_MIN_GAP_MS);
+  }
+
+  if (g_lastMotorM1Sent != m1_tgt || g_lastMotorM3Sent != m3_tgt) {
+    motorSendDriveFrame(typeStr, m1_tgt, m3_tgt);
+    Serial.println("[motor] guard: slew step cap, forced final frame");
+  }
 }
 
 float readDistanceCm() {
@@ -740,7 +832,7 @@ void handleRoot() {
       <label><input type="radio" name="mode" value="pwm" checked /> PWM模式</label>
       <label><input type="radio" name="mode" value="spd" /> 速度模式(编码器)</label>
     </div>
-    <div class="hint">PWM范围: -3600~3600，速度范围: -1000~1000。可在数字框直接输入 M1/M3，改完点「发送」或框内回车下发。</div>
+    <div class="hint">PWM范围: -3600~3600，速度范围: -1000~1000。可在数字框直接输入 M1/M3，改完点「发送」或框内回车下发。固件 5.2.1：下发时自动限频、反向先经零、分步变速（减轻 H 桥应力）。</div>
   </div>
 
   <div class="card">
@@ -967,8 +1059,8 @@ void handleDrive() {
   int m2 = 0;
   int m4 = 0;
 
-  String command = buildCommand(isSpd ? "spd" : "pwm", m1, m2, m3, m4);
-  sendMotorCommand(command);
+  applyMotorDriveWithGuards(isSpd, m1, m3);
+  const String command = buildCommand(isSpd ? "spd" : "pwm", g_lastMotorM1Sent, m2, g_lastMotorM3Sent, m4);
 
   String resp = "{\"ok\":true,\"command\":\"" + command + "\"}";
   server.send(200, "application/json", resp);
@@ -1042,26 +1134,80 @@ void handleCmd() {
   server.send(400, "text/plain; charset=utf-8", "unknown_cmd");
 }
 
+static void dumpSerialVerboseSnapshot() {
+  Serial.printf("  heap=%u WiFi_mode=%d IP=%s\n", (unsigned)ESP.getFreeHeap(), (int)WiFi.getMode(),
+                wifiStationOrApIp().c_str());
+  Serial.printf("  motor last M1=%d M3=%d enc_online=%d\n", g_lastMotorM1Sent, g_lastMotorM3Sent,
+                g_mspdOnline ? 1 : 0);
+  Serial.printf("  imu_ok=%d len_cm=%.1f v_cms=%.2f\n", (g_qmaReady && g_hasImuSample) ? 1 : 0,
+                g_distanceCm, g_speedCms);
+}
+
+void pollSerialVerboseSwitch() {
+  while (Serial.available()) {
+    const char c = (char)Serial.read();
+    if (c == '\r') {
+      continue;
+    }
+    if (c == '\n') {
+      s_usbDbgLineBuf.trim();
+      if (s_usbDbgLineBuf.length() > 0) {
+        if (s_usbDbgLineBuf.equalsIgnoreCase("XCDBG1")) {
+          g_serialVerbose = true;
+          Serial.println("[serial] verbose ON");
+          dumpSerialVerboseSnapshot();
+        } else if (s_usbDbgLineBuf.equalsIgnoreCase("XCDBG0")) {
+          g_serialVerbose = false;
+          Serial.println("[serial] verbose OFF");
+        }
+      }
+      s_usbDbgLineBuf = "";
+    } else if (s_usbDbgLineBuf.length() < 48) {
+      s_usbDbgLineBuf += c;
+    }
+  }
+}
+
+static void maybePrintQuietRunLog() {
+  if (g_serialVerbose) {
+    return;
+  }
+  const unsigned long now = millis();
+  if (now - g_lastQuietRunLogMs < QUIET_RUN_LOG_INTERVAL_MS) {
+    return;
+  }
+  g_lastQuietRunLogMs = now;
+  if (g_distanceCm < 0.0f) {
+    Serial.printf("[run] len=-- v=%.1f enc=%d h=%u\n", g_speedCms, g_mspdOnline ? 1 : 0,
+                  (unsigned)ESP.getFreeHeap());
+  } else {
+    Serial.printf("[run] len=%.0f v=%.1f enc=%d h=%u\n", g_distanceCm, g_speedCms, g_mspdOnline ? 1 : 0,
+                  (unsigned)ESP.getFreeHeap());
+  }
+}
+
 bool connectWifi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
-  Serial.printf("Connecting to Wi-Fi: %s\n", WIFI_SSID);
+  SERIAL_VF("Connecting to Wi-Fi: %s\n", WIFI_SSID);
   unsigned long startMs = millis();
   const unsigned long timeoutMs = 15000;
 
   while (WiFi.status() != WL_CONNECTED && (millis() - startMs) < timeoutMs) {
     delay(500);
-    Serial.print(".");
+    if (g_serialVerbose) {
+      Serial.print(".");
+    }
   }
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println();
-    Serial.print("Wi-Fi connected. IP: ");
-    Serial.println(WiFi.localIP());
+    SERIAL_VF("\nWi-Fi connected. IP: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("[run] WiFi STA IP=%s\n", WiFi.localIP().toString().c_str());
     return true;
   }
 
-  Serial.println("\nWi-Fi connect failed.");
+  SERIAL_VF("\nWi-Fi connect failed.\n");
+  Serial.println("[run] WiFi STA connect failed");
   return false;
 }
 
@@ -1069,16 +1215,15 @@ void startAccessPointFallback() {
   WiFi.mode(WIFI_AP);
   bool ok = WiFi.softAP(AP_SSID, AP_PASS);
   if (!ok) {
-    Serial.println("AP start failed.");
+    Serial.println("[run] AP start failed");
+    SERIAL_VF("AP start failed.\n");
     return;
   }
 
-  Serial.print("AP started. SSID: ");
-  Serial.println(AP_SSID);
-  Serial.print("AP password: ");
-  Serial.println(AP_PASS);
-  Serial.print("AP IP: ");
-  Serial.println(WiFi.softAPIP());
+  SERIAL_VF("AP started. SSID: %s\n", AP_SSID);
+  SERIAL_VF("AP password: %s\n", AP_PASS);
+  SERIAL_VF("AP IP: %s\n", WiFi.softAPIP().toString().c_str());
+  Serial.printf("[run] WiFi AP IP=%s ssid=%s\n", WiFi.softAPIP().toString().c_str(), AP_SSID);
 }
 
 void initArduinoOta() {
@@ -1088,12 +1233,19 @@ void initArduinoOta() {
   }
 
   ArduinoOTA.onStart([]() {
-    Serial.println("[OTA] start update");
+    if (g_serialVerbose) {
+      Serial.println("[OTA] start update");
+    }
   });
   ArduinoOTA.onEnd([]() {
-    Serial.println("\n[OTA] finished, rebooting");
+    if (g_serialVerbose) {
+      Serial.println("\n[OTA] finished, rebooting");
+    }
   });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    if (!g_serialVerbose) {
+      return;
+    }
     unsigned int pct = total ? (progress * 100 / total) : 0;
     Serial.printf("[OTA] %u%%\r", pct);
   });
@@ -1115,27 +1267,26 @@ void initArduinoOta() {
   });
 
   ArduinoOTA.begin();
-  Serial.printf("[OTA] ArduinoOTA hostname=%s IP=%s password=%s\r\n",
-                OTA_HOSTNAME, wifiStationOrApIp().c_str(),
-                (OTA_PASSWORD && strlen(OTA_PASSWORD)) ? "(set)" : "(none)");
+  SERIAL_VF("[OTA] ArduinoOTA hostname=%s IP=%s password=%s\r\n", OTA_HOSTNAME, wifiStationOrApIp().c_str(),
+             (OTA_PASSWORD && strlen(OTA_PASSWORD)) ? "(set)" : "(none)");
 }
 
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.printf("xiaoche firmware %s\r\n", FIRMWARE_VERSION);
+  Serial.printf("FW %s | USB: XCDBG1=full log XCDBG0=quiet\r\n", FIRMWARE_VERSION);
 
   pinMode(ULTRA_TRIG_PIN, OUTPUT);
   pinMode(ULTRA_ECHO_PIN, INPUT);
   digitalWrite(ULTRA_TRIG_PIN, LOW);
-  Serial.printf("HY-SRF05 pins: TRIG=GPIO%d, ECHO=GPIO%d\n", ULTRA_TRIG_PIN, ULTRA_ECHO_PIN);
+  SERIAL_VF("HY-SRF05 pins: TRIG=GPIO%d, ECHO=GPIO%d\n", ULTRA_TRIG_PIN, ULTRA_ECHO_PIN);
 
   bool lcdOk = initLcd();
-  Serial.printf("LCD pins: CS=GPIO%d DC=GPIO%d SCK=GPIO%d MOSI=GPIO%d | XL9555 RST=IO1_2 PWR=IO1_3\n",
-                LCD_CS_PIN, LCD_DC_PIN, LCD_SCK_PIN, LCD_MOSI_PIN);
-  Serial.printf("LCD init: %s\n", lcdOk ? "OK" : "FAILED");
+  SERIAL_VF("LCD pins: CS=GPIO%d DC=GPIO%d SCK=GPIO%d MOSI=GPIO%d | XL9555 RST=IO1_2 PWR=IO1_3\n",
+            LCD_CS_PIN, LCD_DC_PIN, LCD_SCK_PIN, LCD_MOSI_PIN);
+  SERIAL_VF("LCD init: %s\n", lcdOk ? "OK" : "FAILED");
   g_qmaReady = qma6100pInit();
-  Serial.printf("QMA6100P init: %s\n", g_qmaReady ? "OK" : "FAILED");
+  SERIAL_VF("QMA6100P init: %s\n", g_qmaReady ? "OK" : "FAILED");
   g_distanceCm = readDistanceCm();
   if (g_qmaReady) {
     g_hasImuSample = readImuData(g_imuPitchDeg, g_imuRollDeg, g_imuAccelAbs);
@@ -1145,7 +1296,10 @@ void setup() {
   delay(50);
   // Second flag: $MTEP:M1,M2,M3,M4# (pulse delta per 10 ms). Third flag is $MSPD (needs $wdiameter on board).
   sendMotorCommand("$upload:0,1,0#");
-  Serial.println("Motor upload: MTEP ON (10ms pulses), MSPD OFF");
+  g_lastMotorCmdMs = millis();
+  g_lastMotorM1Sent = 0;
+  g_lastMotorM3Sent = 0;
+  SERIAL_VF("Motor upload: MTEP ON (10ms pulses), MSPD OFF\n");
 
   bool wifiOk = connectWifi();
   if (!wifiOk) {
@@ -1161,21 +1315,24 @@ void setup() {
   server.begin();
   g_debugTcp.begin();
 
-  Serial.println("Web server started.");
+  SERIAL_VF("Web server started.\n");
   if (WiFi.getMode() == WIFI_AP) {
-    Serial.println("Open in phone browser: http://192.168.4.1/");
+    SERIAL_VF("Open in phone browser: http://192.168.4.1/\n");
   } else {
-    Serial.print("Open in phone browser: http://");
-    Serial.print(WiFi.localIP());
-    Serial.println("/");
+    SERIAL_VF("Open in phone browser: http://%s/\n", WiFi.localIP().toString().c_str());
   }
-  Serial.printf("WiFi debug: http://%s/debug   JSON: http://%s/api/live   TCP:%u (JSON lines)\r\n",
-                wifiStationOrApIp().c_str(), wifiStationOrApIp().c_str(), (unsigned)DEBUG_TCP_PORT);
+  SERIAL_VF("WiFi debug: http://%s/debug   JSON: http://%s/api/live   TCP:%u (JSON lines)\r\n",
+            wifiStationOrApIp().c_str(), wifiStationOrApIp().c_str(), (unsigned)DEBUG_TCP_PORT);
+  Serial.printf("[run] HTTP http://%s/  debug /debug  TCP:%u\n", wifiStationOrApIp().c_str(),
+                (unsigned)DEBUG_TCP_PORT);
 
+  g_lastQuietRunLogMs = millis();
   initArduinoOta();
 }
 
 void loop() {
+  pollSerialVerboseSwitch();
+  maybePrintQuietRunLog();
   ArduinoOTA.handle();
   server.handleClient();
   pollKey0SwitchPage();
