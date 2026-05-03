@@ -111,6 +111,12 @@ static const float HEADING_KP_SPD = 1.2f;
 static const float TURN_PWM_GAIN = 900.0f;
 static const float TURN_SPD_GAIN = 250.0f;
 
+// 直行左右不对称微调：仅 tl=tr=0 时叠到 udiff。正值略增大 M3 相对 M1，用于抵消前进右偏等；后退默认 0（本车后退已直）。
+static const float STRAIGHT_TRIM_FWD_PWM = 35.0f;
+static const float STRAIGHT_TRIM_REV_PWM = 0.0f;
+static const float STRAIGHT_TRIM_FWD_SPD = 12.0f;
+static const float STRAIGHT_TRIM_REV_SPD = 0.0f;
+
 // ===== WiFi real-time debug (browser + TCP JSON stream) =====
 static const uint16_t DEBUG_TCP_PORT = 8888;
 static const unsigned long DEBUG_TCP_JSON_INTERVAL_MS = 100;
@@ -753,6 +759,14 @@ static void computeMixedMotorOutputs(int want_m1, int want_m3, int tl_deg, int t
   } else {
     udiff += turnMag * TURN_PWM_GAIN;
     udiff += yawErr * HEADING_KP_PWM;
+  }
+  if (tl_deg == 0 && tr_deg == 0) {
+    const float mid = ((float)want_m1 + (float)want_m3) * 0.5f;
+    if (mid > 0.0f) {
+      udiff += isSpd ? STRAIGHT_TRIM_FWD_SPD : STRAIGHT_TRIM_FWD_PWM;
+    } else if (mid < 0.0f) {
+      udiff += isSpd ? STRAIGHT_TRIM_REV_SPD : STRAIGHT_TRIM_REV_PWM;
+    }
   }
   const float m1f = avg - udiff;
   const float m3f = avg + udiff;
