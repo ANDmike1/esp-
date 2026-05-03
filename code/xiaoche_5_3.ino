@@ -108,8 +108,15 @@ static const unsigned long HEADING_CTRL_MS = 80;
 static const float YAW_DEG_PER_MTEP_PDIFF = 0.018f;
 static const float HEADING_KP_PWM = 3.5f;
 static const float HEADING_KP_SPD = 1.2f;
-static const float TURN_PWM_GAIN = 900.0f;
-static const float TURN_SPD_GAIN = 250.0f;
+
+// 左转/右转：按角度定点转弯（转到目标偏航后自动停），见 tickTurnAngleManeuver
+static bool g_turnAngleActive = false;
+static float g_turnTargetYawDeg = 0.0f;
+static unsigned long g_turnAngleStartedMs = 0;
+static const float TURN_ANGLE_TOL_DEG = 5.0f;
+static const unsigned long TURN_ANGLE_TIMEOUT_MS = 25000;
+static const int PIVOT_PWM_CMD = 450;
+static const int PIVOT_SPD_CMD = 150;
 
 // ===== WiFi real-time debug (browser + TCP JSON stream) =====
 static const uint16_t DEBUG_TCP_PORT = 8888;
@@ -295,23 +302,25 @@ void buildLiveJsonTo(char *dst, size_t cap) {
              "{\"uptime_ms\":%lu,\"heap\":%u,\"wifi_mode\":\"%s\",\"ip\":\"%s\","
              "\"spd_ok\":%s,\"spd_cms\":%.2f,\"len_cm\":%.1f,"
              "\"imu_ok\":%s,\"pitch\":%.2f,\"roll\":%.2f,\"acc\":%.3f,"
-             "\"yaw_est\":%.2f,\"yaw_ref\":%.2f,\"hdg_hold\":%s}",
+             "\"yaw_est\":%.2f,\"yaw_ref\":%.2f,\"hdg_hold\":%s,\"turn_active\":%s}",
              (unsigned long)millis(), (unsigned)ESP.getFreeHeap(), wifiModeCString(), ip,
              g_mspdOnline ? "true" : "false", g_speedCms, g_distanceCm,
              (g_qmaReady && g_hasImuSample) ? "true" : "false",
              g_imuPitchDeg, g_imuRollDeg, g_imuAccelAbs,
-             g_yawEstDeg, g_yawRefDeg, g_headingHold ? "true" : "false");
+             g_yawEstDeg, g_yawRefDeg, g_headingHold ? "true" : "false",
+             g_turnAngleActive ? "true" : "false");
   } else {
     snprintf(dst, cap,
              "{\"uptime_ms\":%lu,\"heap\":%u,\"wifi_mode\":\"%s\",\"ip\":\"%s\","
              "\"spd_ok\":%s,\"spd_cms\":%.2f,\"len_cm\":-1,"
              "\"imu_ok\":%s,\"pitch\":%.2f,\"roll\":%.2f,\"acc\":%.3f,"
-             "\"yaw_est\":%.2f,\"yaw_ref\":%.2f,\"hdg_hold\":%s}",
+             "\"yaw_est\":%.2f,\"yaw_ref\":%.2f,\"hdg_hold\":%s,\"turn_active\":%s}",
              (unsigned long)millis(), (unsigned)ESP.getFreeHeap(), wifiModeCString(), ip,
              g_mspdOnline ? "true" : "false", g_speedCms,
              (g_qmaReady && g_hasImuSample) ? "true" : "false",
              g_imuPitchDeg, g_imuRollDeg, g_imuAccelAbs,
-             g_yawEstDeg, g_yawRefDeg, g_headingHold ? "true" : "false");
+             g_yawEstDeg, g_yawRefDeg, g_headingHold ? "true" : "false",
+             g_turnAngleActive ? "true" : "false");
   }
 }
 
@@ -367,7 +376,8 @@ void handleDebugPage() {
           ["加速度偏差 (m/s²)", j.acc],
           ["航向估计 yaw_est (°)", j.yaw_est],
           ["航向参考 yaw_ref (°)", j.yaw_ref],
-          ["航向保持", j.hdg_hold]
+          ["航向保持", j.hdg_hold],
+          ["定点转弯进行中", j.turn_active]
         ];
         document.getElementById("tbl").innerHTML = rows
           .map(([k, v]) => "<tr><td>" + k + "</td><td>" + v + "</td></tr>")
@@ -739,19 +749,15 @@ int clampValue(int value, int minV, int maxV) {
   return value;
 }
 
-static void computeMixedMotorOutputs(int want_m1, int want_m3, int tl_deg, int tr_deg, bool isSpd, int *out_m1,
-                                     int *out_m3) {
+static void computeMixedMotorOutputs(int want_m1, int want_m3, bool isSpd, int *out_m1, int *out_m3) {
   const int minV = isSpd ? -1000 : -3600;
   const int maxV = isSpd ? 1000 : 3600;
   const float avg = ((float)want_m1 + (float)want_m3) * 0.5f;
   float udiff = ((float)want_m3 - (float)want_m1) * 0.5f;
-  const float turnMag = ((float)tr_deg - (float)tl_deg) / 180.0f;
   const float yawErr = headingWrapDeg(g_yawRefDeg - g_yawEstDeg);
   if (isSpd) {
-    udiff += turnMag * TURN_SPD_GAIN;
     udiff += yawErr * HEADING_KP_SPD;
   } else {
-    udiff += turnMag * TURN_PWM_GAIN;
     udiff += yawErr * HEADING_KP_PWM;
   }
   const float m1f = avg - udiff;
@@ -808,8 +814,44 @@ static void motorSendDriveFrame(const char *typeStr, int m1, int m3) {
   g_lastMotorM3Sent = m3;
 }
 
+static void tickTurnAngleManeuver() {
+  if (!g_turnAngleActive) {
+    return;
+  }
+  const unsigned long now = millis();
+  if (now - g_turnAngleStartedMs > TURN_ANGLE_TIMEOUT_MS) {
+    motorSendDriveFrame(g_drvIsSpd ? "spd" : "pwm", 0, 0);
+    g_turnAngleActive = false;
+    g_drvTurnL = 0;
+    g_drvTurnR = 0;
+    g_yawRefDeg = g_yawEstDeg;
+    SERIAL_VF("[turn] angle timeout, stopped\r\n");
+    return;
+  }
+
+  float err = headingWrapDeg(g_turnTargetYawDeg - g_yawEstDeg);
+  if (fabsf(err) < TURN_ANGLE_TOL_DEG) {
+    motorSendDriveFrame(g_drvIsSpd ? "spd" : "pwm", 0, 0);
+    g_turnAngleActive = false;
+    g_drvTurnL = 0;
+    g_drvTurnR = 0;
+    g_headingHold = false;
+    g_yawRefDeg = g_yawEstDeg;
+    return;
+  }
+
+  const int p = g_drvIsSpd ? PIVOT_SPD_CMD : PIVOT_PWM_CMD;
+  const int dir = (err > 0.0f) ? 1 : -1;
+  const int n1 = -dir * p;
+  const int n3 = dir * p;
+  if (n1 == g_lastMotorM1Sent && n3 == g_lastMotorM3Sent) {
+    return;
+  }
+  motorSendDriveFrame(g_drvIsSpd ? "spd" : "pwm", n1, n3);
+}
+
 static void tickHeadingHold() {
-  if (!g_headingHold) {
+  if (!g_headingHold || g_turnAngleActive) {
     return;
   }
   const unsigned long now = millis();
@@ -820,7 +862,7 @@ static void tickHeadingHold() {
 
   int m1o = 0;
   int m3o = 0;
-  computeMixedMotorOutputs(g_drvM1, g_drvM3, g_drvTurnL, g_drvTurnR, g_drvIsSpd, &m1o, &m3o);
+  computeMixedMotorOutputs(g_drvM1, g_drvM3, g_drvIsSpd, &m1o, &m3o);
   if (m1o == g_lastMotorM1Sent && m3o == g_lastMotorM3Sent) {
     return;
   }
@@ -939,7 +981,7 @@ void handleRoot() {
 
   <div class="card">
     <h2>转向角 (0~180)</h2>
-    <div class="hint">左转 / 右转各一条；只输入数字，不配单位。与上方 M1、M3 一并点击「发送」下发。</div>
+    <div class="hint">左转、右转拉条或填数字（不配单位）。净转角 = 左转 − 右转（度），车到目标偏航后自动停车；与 M1/M3 同点发送时优先执行转弯。</div>
     <div class="row"><label class="wlab">左转</label><input type="number" id="ntl" class="numin" value="0" min="0" max="180" step="1" inputmode="numeric"><input id="tl" type="range" min="0" max="180" value="0"><span class="value" id="vtl">0</span></div>
     <div class="row"><label class="wlab">右转</label><input type="number" id="ntr" class="numin" value="0" min="0" max="180" step="1" inputmode="numeric"><input id="tr" type="range" min="0" max="180" value="0"><span class="value" id="vtr">0</span></div>
   </div>
@@ -1190,19 +1232,62 @@ void handleDrive() {
   const int m2 = 0;
   const int m4 = 0;
 
-  g_drvM1 = m1;
-  g_drvM3 = m3;
-  g_drvTurnL = tl;
-  g_drvTurnR = tr;
   g_drvIsSpd = isSpd;
 
+  if (m1 == 0 && m3 == 0 && tl == 0 && tr == 0) {
+    g_turnAngleActive = false;
+    g_headingHold = false;
+    g_drvTurnL = 0;
+    g_drvTurnR = 0;
+    g_yawRefDeg = g_yawEstDeg;
+    applyMotorDriveWithGuards(isSpd, 0, 0);
+    const String command = buildCommand(isSpd ? "spd" : "pwm", g_lastMotorM1Sent, m2, g_lastMotorM3Sent, m4);
+    server.send(200, "application/json", "{\"ok\":true,\"command\":\"" + command + "\"}");
+    return;
+  }
+
+  const int netTurn = tl - tr;
+  if (netTurn != 0) {
+    int tmag = abs(netTurn);
+    if (tmag > 180) {
+      tmag = 180;
+    }
+    const bool isLeft = netTurn > 0;
+
+    g_turnAngleActive = true;
+    g_headingHold = false;
+    g_drvM1 = m1;
+    g_drvM3 = m3;
+    g_drvTurnL = tl;
+    g_drvTurnR = tr;
+    g_yawRefDeg = g_yawEstDeg;
+    g_turnAngleStartedMs = millis();
+    g_turnTargetYawDeg = headingWrapDeg(g_yawEstDeg + (isLeft ? (float)tmag : -(float)tmag));
+
+    const int p = isSpd ? PIVOT_SPD_CMD : PIVOT_PWM_CMD;
+    float err = headingWrapDeg(g_turnTargetYawDeg - g_yawEstDeg);
+    const int dir = (err > 0.0f) ? 1 : -1;
+    motorSendDriveFrame(isSpd ? "spd" : "pwm", -dir * p, dir * p);
+
+    const String command = buildCommand(isSpd ? "spd" : "pwm", g_lastMotorM1Sent, m2, g_lastMotorM3Sent, m4);
+    String resp = "{\"ok\":true,\"command\":\"" + command + "\",\"turn\":\"angle\",\"deg\":" + String(tmag) +
+                   ",\"dir\":\"" + String(isLeft ? "L" : "R") + "\"}";
+    server.send(200, "application/json", resp);
+    return;
+  }
+
+  g_turnAngleActive = false;
+  g_drvM1 = m1;
+  g_drvM3 = m3;
+  g_drvTurnL = 0;
+  g_drvTurnR = 0;
   g_yawRefDeg = g_yawEstDeg;
 
   int out1 = 0;
   int out3 = 0;
-  computeMixedMotorOutputs(m1, m3, tl, tr, isSpd, &out1, &out3);
+  computeMixedMotorOutputs(m1, m3, isSpd, &out1, &out3);
 
-  g_headingHold = (out1 != 0 || out3 != 0 || tl != 0 || tr != 0);
+  g_headingHold = (out1 != 0 || out3 != 0);
 
   applyMotorDriveWithGuards(isSpd, out1, out3);
   const String command = buildCommand(isSpd ? "spd" : "pwm", g_lastMotorM1Sent, m2, g_lastMotorM3Sent, m4);
@@ -1293,7 +1378,8 @@ static void dumpSerialVerboseSnapshot() {
                 g_mspdOnline ? 1 : 0);
   Serial.printf("  imu_ok=%d len_cm=%.1f v_cms=%.2f\n", (g_qmaReady && g_hasImuSample) ? 1 : 0,
                 g_distanceCm, g_speedCms);
-  Serial.printf("  yaw_est=%.2f yaw_ref=%.2f hdg_hold=%d\n", g_yawEstDeg, g_yawRefDeg, g_headingHold ? 1 : 0);
+  Serial.printf("  yaw_est=%.2f yaw_ref=%.2f hdg_hold=%d turn_act=%d\n", g_yawEstDeg, g_yawRefDeg,
+                g_headingHold ? 1 : 0, g_turnAngleActive ? 1 : 0);
 }
 
 void pollSerialVerboseSwitch() {
@@ -1486,6 +1572,7 @@ void setup() {
 void loop() {
   pollSerialVerboseSwitch();
   maybePrintQuietRunLog();
+  tickTurnAngleManeuver();
   tickHeadingHold();
   ArduinoOTA.handle();
   server.handleClient();
