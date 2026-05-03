@@ -63,3 +63,9 @@
 - 根目录 `README.md` 新增「小车固件 USB 串口」小节，说明 `XCDBG1` / `XCDBG0` 与默认行为。
 待办：无。
 
+--------------------------------------------------------------------------------
+[2026-05-02] 回合：xiaoche 5.3 航向与转向网页
+- 新增 `code/xiaoche_5_3.ino`（FW 5.3）：纠正全前进/后退预设符号；`$MTEP` 差速积分 yaw + 每次指令对齐参考 + `tickHeadingHold`；网页 `tl`/`tr` 左转右转 0~180；`/api/cmd?cmd=get_yaw`；`/api/live` 增加 yaw 字段。
+- `README.md` 补充 5.3 小节说明 IMU 能力与航向来源。
+待办：实车标定 `YAW_DEG_PER_MTEP_PDIFF`、HEADING_KP_*、TURN_* 增益。
+
