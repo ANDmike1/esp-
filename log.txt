@@ -70,8 +70,7 @@
 待办：实车标定 `YAW_DEG_PER_MTEP_PDIFF`、HEADING_KP_*、TURN_* 增益。
 
 --------------------------------------------------------------------------------
-[2026-05-02] 回合：5.3 左右转为定点角停止
-- `xiaoche_5_3.ino`：净转角 `tl-tr` 触发定点转弯，航向到目标后 `motor 0`；`tickTurnAngleManeuver` 按 `g_turnTargetYawDeg` 闭环；持续差速偏置与 TURN_* 增益已移除；`/api/live` 增加 `turn_active`。
-- `README.md` 同步说明净转角语义。
-待办：若转头方向反了，改 `g_turnTargetYawDeg` 符号或 pivot `dir`。
-
+[2026-05-02] 回合：回退定点转弯改动
+- `xiaoche_5_3.ino`：恢复 `tl`/`tr` 与 `TURN_PWM_GAIN`/`TURN_SPD_GAIN` 的持续差速合成；移除 `tickTurnAngleManeuver` 与 JSON 字段 `turn_active`。
+- `README.md` 恢复 5.3 转向说明为差速偏置表述。
+待办：无。
