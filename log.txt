@@ -74,3 +74,41 @@
 - `xiaoche_5_3.ino`：恢复 `tl`/`tr` 与 `TURN_PWM_GAIN`/`TURN_SPD_GAIN` 的持续差速合成；移除 `tickTurnAngleManeuver` 与 JSON 字段 `turn_active`。
 - `README.md` 恢复 5.3 转向说明为差速偏置表述。
 待办：无。
+
+--------------------------------------------------------------------------------
+[2026-05-02] 回合：README 补充 OpenMV 人像检测脚本说明
+- `README.md`：在「目录说明」中指向 `code/openmv_person_detect.py`；新增「OpenMV 人像检测」小节（用法、串口协议、可调项表）。
+待办：无。
+
+--------------------------------------------------------------------------------
+[2026-05-02] 回合：OpenMV Haar 加载失败修复
+- `code/openmv_person_detect.py`：内置级联改为短名（如 `frontalface`），新增 `load_haar()` 依次尝试短名与 `/frontalface`；增加 `CASCADE_OVERRIDE`。
+- `README.md`：OpenMV 小节增加「故障排除」与 `CASCADE_OVERRIDE` 可调项。
+待办：无。
+
+--------------------------------------------------------------------------------
+[2026-05-02] 回合：README 去掉 OpenMV 调错过程描述
+- `README.md`：删除「故障排除（无法加载 Haar）」小节；`CASCADE_OVERRIDE` 仅保留最终语义说明。
+待办：无。
+
+--------------------------------------------------------------------------------
+[2026-05-02] 回合：OpenMV Haar ENODEV 与 SD 级联尝试
+- `code/openmv_person_detect.py`：`load_haar()` 增加 SD 路径尝试、`TRY_SD_CASCADE`/`CASCADE_SD_PREFIX`；对 Errno 19 给出放置 `.cascade` 与 `CASCADE_OVERRIDE` 提示。
+- `README.md`：OpenMV 小节补充级联来源说明及上述常量表项。
+待办：无。
+
+--------------------------------------------------------------------------------
+[2026-05-02] 回合：OpenMV 无 SD 时肤色回退
+- `code/openmv_person_detect.py`：增加 `BACKEND`（`haar`/`skin`/`auto`），`auto` 在 Haar 失败时改用 LAB 肤色块；协议仍为 `P,1,...` / `P,0`。
+- `README.md`：说明 `BACKEND` 与肤色相关常量。
+待办：无。
+
+--------------------------------------------------------------------------------
+[2026-05-02] 回合：OpenMV auto 模式 Haar 失败日志精简
+- `openmv_person_detect.py`：`attempt_haar_load()` 静默尝试；`auto` 仅打印一行「无可用 Haar…肤色模式」，不再附带整段 OSError。
+待办：无。
+
+--------------------------------------------------------------------------------
+[2026-05-02] 回合：OpenMV 简化为 L/R/C/N 串口
+- `openmv_person_detect.py`：仅肤色块；UART 每行 `L`/`R`/`C`/`N`；`README.md` 同步。
+待办：无。
