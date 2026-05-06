@@ -6,6 +6,8 @@
 
 | 路径 | 内容说明 |
 |------|----------|
+| `.cursor/skills/hardware-solution/` | NextBoard 硬件方案设计 Skill（`SKILL.md` 与 `references/`）；对话中可用 `$hardware-solution` 触发，详见根目录 `AGENTS.md`。 |
+| `docs/hardware/` | `$hardware-solution` 产出：`01`～`06`、**BOM**（`07`）、**布线/上电**（`08`）、**投产核对**（`09-pre-order-checklist.md`）等。 |
 | `code/` | 代码与运行产物目录。其下 `数据手册/` 中存放多份带时间戳的运行或抓包日志（`.txt`），可按文件名日期检索；`openmv_person_detect.py` 为 OpenMV IDE 脚本：肤色块判左右/中线（见下文）。 |
 | `ESP32S3_Phone_HTTP_Cmd/` | ESP32-S3 相关工程目录，内含同名 `.ino` 主文件；请用 **Arduino IDE** 或 **Arduino CLI** 打开该文件夹后编译、选择开发板与串口再上传。 |
 | `md/` | Agent 会话产出的 Markdown 说明归档；子文件夹名对应该次任务的精炼主题。 |
