@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hardware Solution"
+  short_description: "Hardware architecture and schematic planning workflow"
+  default_prompt: "Use $hardware-solution to produce a complete embedded hardware design proposal for my product requirements."
