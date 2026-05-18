@@ -25,15 +25,16 @@ const char *OTA_HOSTNAME = "xiaoche-ota";
 const char *OTA_PASSWORD = "xiaocheota";
 
 // ===== 新电机驱动板：每路 AT8236 用 IN1/IN2；霍尔仅 AB 相（四线电机 ×2）=====
-// 按你联调接线修改；超声波已挪到 17/18，避免与电机 4~7 冲突。
+// 引脚按你板子实际引出配置：4~7 电机，9~10 / 15~16 霍尔，17~18 超声。
+// 可用引出：4,5,6,7,9,10,14~20,35~39,45~48,3,46 等（勿与下列重复）。
 static const int M1_IN1_PIN = 4;
 static const int M1_IN2_PIN = 5;
 static const int M3_IN1_PIN = 6;
 static const int M3_IN2_PIN = 7;
-static const int ENC_M1_A_PIN = 10;
-static const int ENC_M1_B_PIN = 11;
-static const int ENC_M3_A_PIN = 12;
-static const int ENC_M3_B_PIN = 13;
+static const int ENC_M1_A_PIN = 9;
+static const int ENC_M1_B_PIN = 10;
+static const int ENC_M3_A_PIN = 15;
+static const int ENC_M3_B_PIN = 16;
 
 static const uint32_t MOTOR_PWM_FREQ_HZ = 25000;
 static const uint8_t MOTOR_PWM_BITS = 8;
@@ -1377,7 +1378,12 @@ void handleDrive() {
   applyMotorDriveWithGuards(isSpd, out1, out3);
   const String command = buildCommand(isSpd ? "spd" : "pwm", g_lastMotorM1Sent, m2, g_lastMotorM3Sent, m4);
 
-  String resp = "{\"ok\":true,\"command\":\"" + command + "\"}";
+  Serial.printf("[drive] in m1=%d m3=%d -> out %d,%d | pwm_gpio %d,%d\n", m1, m3, out1, out3, g_motorPwmM1,
+                g_motorPwmM3);
+
+  String resp = "{\"ok\":true,\"command\":\"" + command + "\",\"out_m1\":" + String(out1) +
+                ",\"out_m3\":" + String(out3) + ",\"pwm_m1\":" + String(g_motorPwmM1) +
+                ",\"pwm_m3\":" + String(g_motorPwmM3) + "}";
   server.send(200, "application/json", resp);
 }
 
@@ -1424,6 +1430,19 @@ void handleCmd() {
     return;
   }
 
+  if (cmd == "motor_raw") {
+    const int p1 = server.hasArg("m1") ? server.arg("m1").toInt() : 0;
+    const int p3 = server.hasArg("m3") ? server.arg("m3").toInt() : 0;
+    motorApplyPwmDirect(clampValue(p1, -MOTOR_PWM_CMD_MAX, MOTOR_PWM_CMD_MAX),
+                        clampValue(p3, -MOTOR_PWM_CMD_MAX, MOTOR_PWM_CMD_MAX));
+    g_lastMotorM1Sent = p1;
+    g_lastMotorM3Sent = p3;
+    g_headingHold = false;
+    server.send(200, "text/plain; charset=utf-8",
+                "motor_raw pwm_m1=" + String(g_motorPwmM1) + " pwm_m3=" + String(g_motorPwmM3));
+    return;
+  }
+
   if (cmd == "get_yaw" || cmd == "yaw") {
     String s = "yaw_est:" + String(g_yawEstDeg, 2) + ",yaw_ref:" + String(g_yawRefDeg, 2) +
                ",hold:" + String(g_headingHold ? 1 : 0);
@@ -1459,8 +1478,8 @@ void handleCmd() {
 static void dumpSerialVerboseSnapshot() {
   Serial.printf("  heap=%u WiFi_mode=%d IP=%s\n", (unsigned)ESP.getFreeHeap(), (int)WiFi.getMode(),
                 wifiStationOrApIp().c_str());
-  Serial.printf("  motor last M1=%d M3=%d enc_online=%d\n", g_lastMotorM1Sent, g_lastMotorM3Sent,
-                g_mspdOnline ? 1 : 0);
+  Serial.printf("  motor cmd M1=%d M3=%d pwm_act %d,%d enc=%d\n", g_lastMotorM1Sent, g_lastMotorM3Sent,
+                g_motorPwmM1, g_motorPwmM3, g_mspdOnline ? 1 : 0);
   Serial.printf("  imu_ok=%d len_cm=%.1f v_cms=%.2f\n", (g_qmaReady && g_hasImuSample) ? 1 : 0,
                 g_distanceCm, g_speedCms);
   Serial.printf("  yaw_est=%.2f yaw_ref=%.2f hdg_hold=%d\n", g_yawEstDeg, g_yawRefDeg, g_headingHold ? 1 : 0);
@@ -1616,7 +1635,7 @@ void setup() {
     g_hasImuSample = readImuData(g_imuPitchDeg, g_imuRollDeg, g_imuAccelAbs);
   }
 
-  initMotorEncoders();
+  initMotorEncoders();  // 在 LCD 之后；编码器脚不可与 LCD_SCK/MOSI(12/11) 共用
   g_lastMotorCmdMs = millis();
   g_lastMotorM1Sent = 0;
   g_lastMotorM3Sent = 0;
