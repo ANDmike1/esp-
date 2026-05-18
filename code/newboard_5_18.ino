@@ -100,6 +100,14 @@ static int32_t g_encDeltaM3 = 0;
 static int g_motorPwmM1 = 0;
 static int g_motorPwmM3 = 0;
 static bool g_ledcOnPin[48] = {false};
+// -1=未知 0/1=GPIO 电平 2=该脚正在 LEDC；避免航向环每 80ms gpio_reset 打断双路 PWM
+static int8_t g_motorPinOut[48];
+static uint16_t g_motorPwmDuty[48];
+static int g_m1PwmActivePin = -1;
+static int g_m3PwmActivePin = -1;
+static const int MOTOR_LEDC_CH_M1 = 0;
+static const int MOTOR_LEDC_CH_M3 = 1;
+static const int HEADING_PWM_REAPPLY_DEADBAND = 12;
 static unsigned long g_lastEncSampleMs = 0;
 static const unsigned long ENC_SAMPLE_MS = 10;
 
@@ -477,18 +485,38 @@ void IRAM_ATTR encM3Isr() {
   encApplyDelta(&g_encCountM3, &g_encAbM3, ENC_M3_A_PIN, ENC_M3_B_PIN);
 }
 
+static void motorPinStateInvalidate(int pin) {
+  if (pin >= 0 && pin < 48) {
+    g_motorPinOut[pin] = -1;
+  }
+}
+
 static void motorLedcDetachPin(int pin) {
   if (pin < 0 || pin >= 48 || !g_ledcOnPin[pin]) {
     return;
   }
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
   ledcDetach((uint8_t)pin);
+#else
+  const int ch = (pin == M1_IN1_PIN || pin == M1_IN2_PIN) ? MOTOR_LEDC_CH_M1 : MOTOR_LEDC_CH_M3;
+  ledcWrite(ch, 0);
 #endif
   g_ledcOnPin[pin] = false;
+  g_motorPinOut[pin] = -1;
+  g_motorPwmDuty[pin] = 0;
 }
 
-static void motorPinForce(int pin, int level) {
-  motorLedcDetachPin(pin);
+static void motorPinForce(int pin, int level, bool force = false) {
+  if (pin < 0 || pin >= 48) {
+    return;
+  }
+  const int8_t tgt = level ? 1 : 0;
+  if (!force && g_motorPinOut[pin] == tgt) {
+    return;
+  }
+  if (g_motorPinOut[pin] == 2) {
+    motorLedcDetachPin(pin);
+  }
 #if defined(ESP32)
   gpio_reset_pin((gpio_num_t)pin);
   gpio_set_direction((gpio_num_t)pin, GPIO_MODE_OUTPUT);
@@ -499,9 +527,14 @@ static void motorPinForce(int pin, int level) {
   pinMode(pin, OUTPUT);
   digitalWrite(pin, level ? HIGH : LOW);
 #endif
+  g_motorPinOut[pin] = tgt;
+  g_motorPwmDuty[pin] = 0;
 }
 
-static void motorPinPwm(int pin, uint16_t duty) {
+static void motorPinPwm(int pin, int ledcCh, uint16_t duty) {
+  if (pin < 0 || pin >= 48) {
+    return;
+  }
   if (duty >= MOTOR_PWM_MAX) {
     motorPinForce(pin, 1);
     return;
@@ -510,23 +543,26 @@ static void motorPinPwm(int pin, uint16_t duty) {
     motorPinForce(pin, 0);
     return;
   }
-  if (pin >= 0 && pin < 48 && !g_ledcOnPin[pin]) {
+  if (g_motorPinOut[pin] == 2 && g_motorPwmDuty[pin] == duty) {
+    return;
+  }
+  if (g_motorPinOut[pin] != 2) {
     pinMode(pin, OUTPUT);
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
     ledcAttach((uint8_t)pin, MOTOR_PWM_FREQ_HZ, MOTOR_PWM_BITS);
 #else
-    static int ledcCh = 0;
     ledcSetup(ledcCh, MOTOR_PWM_FREQ_HZ, MOTOR_PWM_BITS);
     ledcAttachPin(pin, ledcCh);
-    ledcCh = (ledcCh + 1) % 8;
 #endif
     g_ledcOnPin[pin] = true;
+    g_motorPinOut[pin] = 2;
   }
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
   ledcWrite((uint8_t)pin, duty);
 #else
-  ledcWrite(pin, duty);
+  ledcWrite(ledcCh, duty);
 #endif
+  g_motorPwmDuty[pin] = duty;
 }
 
 static uint16_t motorCmdToDuty(int cmd) {
@@ -535,29 +571,40 @@ static uint16_t motorCmdToDuty(int cmd) {
   return (uint16_t)((uint32_t)MOTOR_PWM_MAX * (uint32_t)clamped / (uint32_t)MOTOR_PWM_CMD_MAX);
 }
 
-static void motorWheelCoast(int in1, int in2) {
-  motorPinForce(in1, 0);
-  motorPinForce(in2, 0);
+static void motorWheelCoast(int in1, int in2, int *activePwmPin) {
+  if (activePwmPin != nullptr && *activePwmPin >= 0) {
+    motorLedcDetachPin(*activePwmPin);
+    *activePwmPin = -1;
+  }
+  motorPinStateInvalidate(in1);
+  motorPinStateInvalidate(in2);
+  motorPinForce(in1, 0, true);
+  motorPinForce(in2, 0, true);
 }
 
-static void motorWheelDrive(int in1, int in2, int signedCmd) {
+static void motorWheelDrive(int in1, int in2, int signedCmd, int ledcCh, int *activePwmPin) {
   if (signedCmd == 0) {
-    motorWheelCoast(in1, in2);
+    motorWheelCoast(in1, in2, activePwmPin);
     return;
   }
   const uint16_t duty = motorCmdToDuty(signedCmd);
-  if (signedCmd > 0) {
-    motorPinForce(in2, 0);
-    motorPinPwm(in1, duty);
-  } else {
-    motorPinForce(in1, 0);
-    motorPinPwm(in2, duty);
+  const int pwmPin = signedCmd > 0 ? in1 : in2;
+  const int gndPin = signedCmd > 0 ? in2 : in1;
+  if (activePwmPin != nullptr && *activePwmPin >= 0 && *activePwmPin != pwmPin) {
+    motorLedcDetachPin(*activePwmPin);
+    motorPinForce(*activePwmPin, 0, true);
+    *activePwmPin = -1;
   }
+  if (activePwmPin != nullptr) {
+    *activePwmPin = pwmPin;
+  }
+  motorPinForce(gndPin, 0);
+  motorPinPwm(pwmPin, ledcCh, duty);
 }
 
 static void motorApplyPwmDirect(int m1, int m3) {
-  motorWheelDrive(M1_IN1_PIN, M1_IN2_PIN, m1);
-  motorWheelDrive(M3_IN1_PIN, M3_IN2_PIN, m3);
+  motorWheelDrive(M1_IN1_PIN, M1_IN2_PIN, m1, MOTOR_LEDC_CH_M1, &g_m1PwmActivePin);
+  motorWheelDrive(M3_IN1_PIN, M3_IN2_PIN, m3, MOTOR_LEDC_CH_M3, &g_m3PwmActivePin);
   g_motorPwmM1 = m1;
   g_motorPwmM3 = m3;
 }
@@ -661,8 +708,12 @@ static void initMotorEncoders() {
   pinMode(M1_IN2_PIN, OUTPUT);
   pinMode(M3_IN1_PIN, OUTPUT);
   pinMode(M3_IN2_PIN, OUTPUT);
-  motorWheelCoast(M1_IN1_PIN, M1_IN2_PIN);
-  motorWheelCoast(M3_IN1_PIN, M3_IN2_PIN);
+  memset(g_motorPinOut, -1, sizeof(g_motorPinOut));
+  memset(g_motorPwmDuty, 0, sizeof(g_motorPwmDuty));
+  g_m1PwmActivePin = -1;
+  g_m3PwmActivePin = -1;
+  motorWheelCoast(M1_IN1_PIN, M1_IN2_PIN, &g_m1PwmActivePin);
+  motorWheelCoast(M3_IN1_PIN, M3_IN2_PIN, &g_m3PwmActivePin);
   g_encSnapM1 = 0;
   g_encSnapM3 = 0;
   g_lastEncSampleMs = millis();
@@ -1026,6 +1077,12 @@ static void tickHeadingHold() {
   const bool spdStuckZero = g_drvIsSpd && (m1o != 0 || m3o != 0) && g_motorPwmM1 == 0 && g_motorPwmM3 == 0;
   if (m1o == g_lastMotorM1Sent && m3o == g_lastMotorM3Sent && !spdStuckZero) {
     return;
+  }
+  if (!g_drvIsSpd && !spdStuckZero && (m1o != 0 || m3o != 0)) {
+    if (abs(m1o - g_lastMotorM1Sent) < HEADING_PWM_REAPPLY_DEADBAND &&
+        abs(m3o - g_lastMotorM3Sent) < HEADING_PWM_REAPPLY_DEADBAND) {
+      return;
+    }
   }
 
   motorSendDriveFrame(g_drvIsSpd ? "spd" : "pwm", m1o, m3o);
