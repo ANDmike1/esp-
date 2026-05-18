@@ -12,7 +12,7 @@
 #endif
 
 // ===== newboard 5.18：AT8236×2 直驱 + MG310 霍尔 AB，无 UART 电机板 =====
-static const char FIRMWARE_VERSION[] = "newboard-5.18";
+static const char FIRMWARE_VERSION[] = "newboard-5.18.1";
 
 // ===== Wi-Fi config =====
 const char *WIFI_SSID = "520卧龙凤雏";
@@ -36,10 +36,14 @@ static const int ENC_M1_B_PIN = 10;
 static const int ENC_M3_A_PIN = 15;
 static const int ENC_M3_B_PIN = 16;
 
-static const uint32_t MOTOR_PWM_FREQ_HZ = 25000;
+// 25kHz 时 |cmd|≈1200 → duty≈85，高侧开通时间过短，AT8236/MG310 易不转；改 4kHz + 占空比重映射
+static const uint32_t MOTOR_PWM_FREQ_HZ = 4000;
 static const uint8_t MOTOR_PWM_BITS = 8;
 static const uint16_t MOTOR_PWM_MAX = (1u << MOTOR_PWM_BITS) - 1u;
 static const int MOTOR_PWM_CMD_MAX = 3600;
+static const int MOTOR_PWM_CMD_MIN = 280;       // |cmd| 低于此不输出（避免微振）
+static const uint16_t MOTOR_LEDC_DUTY_MIN = 148; // 实测 -2400 附近可转，-1200 线性映射到此以上
+static const uint16_t MOTOR_LEDC_DUTY_MAX = 254; // 255 保留给满速 GPIO 直通
 
 // 软件层：限频 / 反向经零 / 斜坡，减轻 AT8236 应力
 static const unsigned long MOTOR_CMD_MIN_GAP_MS = 45;           // 相邻电机帧最小间隔
@@ -567,8 +571,16 @@ static void motorPinPwm(int pin, int ledcCh, uint16_t duty) {
 
 static uint16_t motorCmdToDuty(int cmd) {
   const int a = abs(cmd);
-  const int clamped = min(a, MOTOR_PWM_CMD_MAX);
-  return (uint16_t)((uint32_t)MOTOR_PWM_MAX * (uint32_t)clamped / (uint32_t)MOTOR_PWM_CMD_MAX);
+  if (a < MOTOR_PWM_CMD_MIN) {
+    return 0;
+  }
+  if (a >= MOTOR_PWM_CMD_MAX) {
+    return MOTOR_PWM_MAX;
+  }
+  const int cmdSpan = MOTOR_PWM_CMD_MAX - MOTOR_PWM_CMD_MIN;
+  const int cmdAbove = a - MOTOR_PWM_CMD_MIN;
+  const uint32_t dutySpan = (uint32_t)MOTOR_LEDC_DUTY_MAX - (uint32_t)MOTOR_LEDC_DUTY_MIN;
+  return (uint16_t)(MOTOR_LEDC_DUTY_MIN + (dutySpan * (uint32_t)cmdAbove) / (uint32_t)cmdSpan);
 }
 
 static void motorWheelCoast(int in1, int in2, int *activePwmPin) {
@@ -1728,7 +1740,8 @@ void setup() {
   g_lastMotorCmdMs = millis();
   g_lastMotorM1Sent = 0;
   g_lastMotorM3Sent = 0;
-  SERIAL_VF("Motor: AT8236 GPIO IN + Hall AB enc (10ms)\n");
+  SERIAL_VF("Motor: AT8236 GPIO IN + Hall AB enc (10ms) PWM %luHz duty %u..%u\n",
+            (unsigned long)MOTOR_PWM_FREQ_HZ, (unsigned)MOTOR_LEDC_DUTY_MIN, (unsigned)MOTOR_LEDC_DUTY_MAX);
   SERIAL_VF("  M1 IN %d,%d  M3 IN %d,%d  ENC %d,%d / %d,%d\n", M1_IN1_PIN, M1_IN2_PIN, M3_IN1_PIN,
             M3_IN2_PIN, ENC_M1_A_PIN, ENC_M1_B_PIN, ENC_M3_A_PIN, ENC_M3_B_PIN);
 
