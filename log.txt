@@ -162,3 +162,13 @@
 - 新建 `docs/hardware/09-pre-order-checklist.md`（原理图/PCB/Gerber/备料/上电衔接）；`08` 增加指向。
 - `07-bom.md` 序号 **2**、§6：入口改为 **SK104B SMB**；`06-decisions` 同步；`README` 增加 **09**。
 待办：合并 PDF 按需执行 `md_to_pdf.py`。
+
+--------------------------------------------------------------------------------
+[2026-05-18] 回合：AT8236 直驱联调 + newboard_5_18 固件
+- 说明 AT8236 IN1/IN2 真值表、PWM 测量（万用表为 VM×占空比）、换向须经零；新增 `code/mg310_at8236_test.ino` 排查固件。
+- 现象 M+/M- 波形相同、对地 ~1.3 V：示波器为差模≈0；串口读回 IN1=IN2=1 为刹车(11)；`f` 后 `motorSlewTick` 立即拉回 00 的固件 bug 已修。
+- 用户实测：**芯片 IN1/IN2 短接、OUT1/OUT2 短接**（PCB 错误）；飞线/修板后 MG310 可转。
+- 拔掉驱动板 GPIO5 正常 0/3.3 V；接上后 IN 同压 ~1.9 V，印证输入短接/打架。
+- 基于 `xiaoche_5_3.ino` 新增 **`code/newboard_5_18.ino`**：AT8236×2 GPIO4~7、霍尔 AB GPIO10~13、超声改 17/18；本地 10 ms 编码器 + 板端速度 P 控；保留 5.3 网页/航向/OTA。
+- 更新 `README.md`（新板引脚与用法）、本 log。
+待办：按实车校准 `ENCODER_PULSES_PER_WHEEL_REV`；确认 M3 电机/编码器线已接到 GPIO6~7、12~13；重打 PCB 修正 IN/OUT 网络。
