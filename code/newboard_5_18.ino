@@ -103,8 +103,11 @@ static bool g_ledcOnPin[48] = {false};
 static unsigned long g_lastEncSampleMs = 0;
 static const unsigned long ENC_SAMPLE_MS = 10;
 
-static const float SPD_PI_KP = 6.0f;
+static const float SPD_PI_KP = 2.0f;           // 过大易判「超速」后把 PWM 拉到 0
 static const float SPD_TO_PWM_SCALE = 3.6f;
+static const int SPD_MIN_PWM = 500;          // |目标|>0 且编码器几乎不动时保底（克服静摩擦）
+static const int SPD_MAX_PI_TRIM = 800;      // 限制 PI 抵消前馈的幅度
+static const int SPD_STALL_ENC_DELTA = 2;    // 10ms 内脉冲数低于此视为该轮未转
 
 // ===== Speed from $MTEP (10 ms encoder delta; no need for driver $wdiameter / MSPD) =====
 // Tune ENCODER_PULSES_PER_WHEEL_REV to match your motor ($mline, $mphase) or by measuring one wheel turn.
@@ -560,14 +563,36 @@ static void motorApplyPwmDirect(int m1, int m3) {
 }
 
 static int speedCmdToPwm(int spdCmd, int32_t encDelta) {
+  if (spdCmd == 0) {
+    return 0;
+  }
+
+  const int feed = clampValue((int)lroundf((float)spdCmd * SPD_TO_PWM_SCALE), -MOTOR_PWM_CMD_MAX,
+                              MOTOR_PWM_CMD_MAX);
+
   float wheelCircCm = 3.14159265358979323846f * SPEED_WHEEL_DIAMETER_CM;
   float revInWindow = (float)encDelta / ENCODER_PULSES_PER_WHEEL_REV;
   float cmInWindow = revInWindow * wheelCircCm;
   float instCms = cmInWindow / MTEP_WINDOW_S;
   const float measSpd = instCms * 10.0f;
   const float err = (float)spdCmd - measSpd;
-  float pwm = (float)spdCmd * SPD_TO_PWM_SCALE + SPD_PI_KP * err;
-  return clampValue((int)lroundf(pwm), -MOTOR_PWM_CMD_MAX, MOTOR_PWM_CMD_MAX);
+  float pi = SPD_PI_KP * err;
+  if (pi > (float)SPD_MAX_PI_TRIM) {
+    pi = (float)SPD_MAX_PI_TRIM;
+  }
+  if (pi < -(float)SPD_MAX_PI_TRIM) {
+    pi = -(float)SPD_MAX_PI_TRIM;
+  }
+
+  int pwm = clampValue((int)lroundf((float)feed + pi), -MOTOR_PWM_CMD_MAX, MOTOR_PWM_CMD_MAX);
+
+  // 该轮命令转但几乎无脉冲：保持前馈，避免 PI 把 PWM 拉到 0（你描述的 B 不转、手拧后才动）
+  if (abs(encDelta) < SPD_STALL_ENC_DELTA) {
+    if (abs(pwm) < SPD_MIN_PWM) {
+      pwm = (spdCmd > 0) ? SPD_MIN_PWM : -SPD_MIN_PWM;
+    }
+  }
+  return pwm;
 }
 
 static void motorApplySpeedDirect(int m1, int m3) {
@@ -911,7 +936,12 @@ static void computeMixedMotorOutputs(int want_m1, int want_m3, int tl_deg, int t
   const float yawErr = headingWrapDeg(g_yawRefDeg - g_yawEstDeg);
   if (isSpd) {
     udiff += turnMag * TURN_SPD_GAIN;
-    udiff += yawErr * HEADING_KP_SPD;
+    // 仅当两轮都有近期脉冲时才用航向 PI，避免「一轮死转、一轮猛转」时把另一路目标打成 0
+    const bool encBoth =
+        abs(g_encDeltaM1) >= SPD_STALL_ENC_DELTA && abs(g_encDeltaM3) >= SPD_STALL_ENC_DELTA;
+    if (encBoth) {
+      udiff += yawErr * HEADING_KP_SPD;
+    }
   } else {
     udiff += turnMag * TURN_PWM_GAIN;
     udiff += yawErr * HEADING_KP_PWM;
@@ -974,8 +1004,9 @@ static void motorSendDriveFrame(const char *typeStr, int m1, int m3) {
   g_lastMotorCmdMs = millis();
   g_lastMotorM1Sent = m1;
   g_lastMotorM3Sent = m3;
-  if (g_serialVerbose) {
-    Serial.printf("[motor] %s M1=%d M3=%d pwm_act %d,%d\n", typeStr, m1, m3, g_motorPwmM1, g_motorPwmM3);
+  if (g_serialVerbose || (strcmp(typeStr, "spd") == 0)) {
+    Serial.printf("[motor] %s tgt M1=%d M3=%d | enc_d %ld,%ld | pwm %d,%d\n", typeStr, m1, m3,
+                  (long)g_encDeltaM1, (long)g_encDeltaM3, g_motorPwmM1, g_motorPwmM3);
   }
 }
 
@@ -992,7 +1023,8 @@ static void tickHeadingHold() {
   int m1o = 0;
   int m3o = 0;
   computeMixedMotorOutputs(g_drvM1, g_drvM3, g_drvTurnL, g_drvTurnR, g_drvIsSpd, &m1o, &m3o);
-  if (m1o == g_lastMotorM1Sent && m3o == g_lastMotorM3Sent) {
+  const bool spdStuckZero = g_drvIsSpd && (m1o != 0 || m3o != 0) && g_motorPwmM1 == 0 && g_motorPwmM3 == 0;
+  if (m1o == g_lastMotorM1Sent && m3o == g_lastMotorM3Sent && !spdStuckZero) {
     return;
   }
 
